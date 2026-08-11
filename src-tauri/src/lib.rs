@@ -269,6 +269,18 @@ fn migrations(c: &Connection) -> rusqlite::Result<()> {
     if !has_v9 {
         c.execute_batch("ALTER TABLE posts ADD COLUMN tiktok_publish_id TEXT; CREATE TABLE IF NOT EXISTS tiktok_accounts(id INTEGER PRIMARY KEY,profile_id INTEGER NOT NULL REFERENCES profiles(id),open_id TEXT NOT NULL,display_name TEXT DEFAULT '',token_reference TEXT,connected INTEGER DEFAULT 0,last_successful_request TEXT); CREATE UNIQUE INDEX IF NOT EXISTS idx_tiktok_profile_unique ON tiktok_accounts(profile_id); INSERT OR IGNORE INTO app_settings(key,value)VALUES('tiktok_connected','false'),('tiktok_reel_copies','false'),('tiktok_publish_mode','draft'); INSERT INTO schema_migrations(version)VALUES(9);")?;
     }
+    let has_v10 = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=10)",
+        [],
+        |r| r.get::<_, bool>(0),
+    )?;
+    if !has_v10 {
+        // The Python publisher creates this table on first run, so a Mac that has
+        // never published had no `publish_recovery` — and `save_facebook_connection`
+        // reads it, failing the connection after the token was already stored.
+        // Schema kept byte-identical to `ensure_recovery_schema` in the publisher.
+        c.execute_batch("CREATE TABLE IF NOT EXISTS publish_recovery(post_id INTEGER PRIMARY KEY REFERENCES posts(id) ON DELETE CASCADE,failure_class TEXT NOT NULL,retry_count INTEGER NOT NULL DEFAULT 0,next_retry_at TEXT,requires_action INTEGER NOT NULL DEFAULT 0,resolution_hint TEXT DEFAULT '',last_error TEXT DEFAULT '',updated_at TEXT DEFAULT CURRENT_TIMESTAMP); INSERT INTO schema_migrations(version)VALUES(10);")?;
+    }
     c.execute(
         "INSERT OR IGNORE INTO app_settings(key,value)VALUES('posting_time_mode','suggest')",
         [],
@@ -681,6 +693,27 @@ fn learned_posting_hours(c: &Connection, count: usize) -> Vec<u32> {
     hours.sort_unstable();
     hours
 }
+/// The set form of [`publishable`], for statements that work over many posts.
+/// Takes no table alias; use it inside `id IN (SELECT id FROM posts WHERE ...)`.
+const PUBLISHABLE_SQL: &str = "((COALESCE(platform,'instagram') IN ('instagram','facebook') AND post_type='single') OR (platform='tiktok' AND post_type='reel'))";
+
+/// Whether SocialFlow can actually publish this combination today.
+///
+/// This is the single source of truth, consulted when content is generated,
+/// when a post is moved towards the queue, and when approving in bulk. Without
+/// it the campaign generator produces carousels, Reels and story packs that
+/// `publish_instagram` structurally refuses, and every one of them fails on its
+/// scheduled day after burning eight retries.
+fn publishable(platform: &str, post_type: &str) -> bool {
+    match platform {
+        // Meta's single-photo endpoints are all the publisher implements.
+        "instagram" | "facebook" => post_type == "single",
+        // TikTok publishes the rendered vertical video and nothing else.
+        "tiktok" => post_type == "reel",
+        _ => false,
+    }
+}
+
 fn supported(p: &Path) -> bool {
     matches!(
         p.extension()
@@ -772,6 +805,17 @@ fn rank_campaign_images(c: &Connection, image_ids: Vec<i64>) -> Vec<i64> {
     diverse.extend(similar);
     diverse
 }
+/// Terms that withhold a photograph under a `no_children` consent level.
+/// Deliberately broad: a false positive costs one unused photograph, a false
+/// negative publishes a child whose family refused permission.
+/// "child" also catches "children", "kid" catches "kids", "boy" catches
+/// "pageboy". Terms broad enough to catch a whole family of words are preferred
+/// over an exhaustive list that will always have a gap in it.
+const CHILD_TERMS: [&str; 10] = [
+    "child", "kid", "boy", "girl", "baby", "babies", "toddler", "infant",
+    "page boy", "daughter",
+];
+
 fn marketing_safe_images(
     c: &Connection,
     wedding_id: i64,
@@ -806,10 +850,17 @@ fn marketing_safe_images(
                     .unwrap_or(false);
             }
             if consent == "no_children" {
-                let description = c
-                    .query_row("SELECT LOWER(COALESCE(description,'')) FROM image_analysis WHERE image_id=?", [id], |r| r.get::<_, String>(0))
-                    .unwrap_or_default();
-                return !["child", "boy", "girl", "baby", "toddler"].iter().any(|term| description.contains(term));
+                // Fail closed. An unanalysed photograph cannot be shown to be free
+                // of children, so it is withheld rather than approved by default —
+                // the permissive branch here published on missing evidence.
+                let Ok(description) = c.query_row(
+                    "SELECT LOWER(COALESCE(a.description,'')||' '||COALESCE(a.sub_category,'')||' '||COALESCE(a.subjects_json,'')) FROM image_analysis a WHERE a.image_id=? AND COALESCE(a.description,'')<>''",
+                    [id],
+                    |r| r.get::<_, String>(0),
+                ) else {
+                    return false;
+                };
+                return !CHILD_TERMS.iter().any(|term| description.contains(term));
             }
             true
         })
@@ -1024,11 +1075,28 @@ fn update_post_status(post_id: i64, status: String, state: State<AppState>) -> R
         return Err("Invalid post status".into());
     }
     let c = state.db.lock().unwrap();
-    let current: String = c
-        .query_row("SELECT status FROM posts WHERE id=?", [post_id], |r| {
-            r.get(0)
-        })
+    let (current, platform, post_type) = c
+        .query_row(
+            "SELECT status,COALESCE(platform,'instagram'),post_type FROM posts WHERE id=?",
+            [post_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
         .map_err(|e| e.to_string())?;
+    // Refuse the queue rather than accepting a post that is certain to fail on
+    // its scheduled day. Say why, and say what the post is still good for.
+    if matches!(status.as_str(), "scheduled" | "publishing")
+        && !publishable(&platform, &post_type)
+    {
+        return Err(format!(
+            "SocialFlow cannot publish a {post_type} to {platform} yet, so this post cannot be scheduled. The rendered asset is ready to post by hand from the post's Reveal asset button."
+        ));
+    }
     let valid = matches!(
         (current.as_str(), status.as_str()),
         ("draft", "needs_review" | "approved")
@@ -1310,8 +1378,14 @@ fn create_content_campaign(
         add_supplier_context(&tx, Some(wedding_id), &mut caption, index);
         let tags = serde_json::to_string(&tag_list).unwrap();
         let learned_hours = learned_posting_hours(&tx, posts_per_day.clamp(1, 5) as usize);
-        let scheduled = next_daily_slot_with_hours(start, index, &learned_hours).to_string();
-        tx.execute("INSERT INTO posts(profile_id,caption,hashtags_json,status,scheduled_at,post_type,ai_generated)VALUES(?,?,?,'needs_review',?,?,1)",params![profile_id,caption,tags,scheduled,format]).map_err(|e|e.to_string())?;
+        // Only queue what the publisher can actually ship. Formats it cannot
+        // publish are still rendered and kept as drafts to use by hand, but they
+        // never take a slot and never fail on their scheduled day.
+        let can_publish = publishable("instagram", format);
+        let scheduled = can_publish
+            .then(|| next_daily_slot_with_hours(start, index, &learned_hours).to_string());
+        let status = if can_publish { "needs_review" } else { "draft" };
+        tx.execute("INSERT INTO posts(profile_id,caption,hashtags_json,status,scheduled_at,post_type,ai_generated)VALUES(?,?,?,?,?,?,1)",params![profile_id,caption,tags,status,scheduled,format]).map_err(|e|e.to_string())?;
         let post_id = tx.last_insert_rowid();
         created_post_ids.push(post_id);
         let mut paths = Vec::new();
@@ -1354,11 +1428,12 @@ fn create_content_campaign(
             .map_err(|e| e.to_string())?;
         }
     }
-    reflow_wedding_rotation(&tx, start, posts_per_day.clamp(1, 5))?;
+    let mut copied_post_ids = Vec::new();
     if facebook_separate {
         for instagram_post_id in &created_post_ids {
             tx.execute("INSERT INTO posts(profile_id,caption,hashtags_json,status,scheduled_at,published_at,post_type,created_at,updated_at,manually_edited_caption,ai_generated,asset_path,platform) SELECT profile_id,caption,hashtags_json,'needs_review',scheduled_at,NULL,post_type,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,0,ai_generated,asset_path,'facebook' FROM posts WHERE id=?", [instagram_post_id]).map_err(|e|e.to_string())?;
             let facebook_post_id = tx.last_insert_rowid();
+            copied_post_ids.push(facebook_post_id);
             tx.execute("INSERT INTO post_images(post_id,image_id,position) SELECT ?,image_id,position FROM post_images WHERE post_id=?", params![facebook_post_id,instagram_post_id]).map_err(|e|e.to_string())?;
         }
     }
@@ -1368,9 +1443,23 @@ fn create_content_campaign(
             if !is_reel { continue; }
             tx.execute("INSERT INTO posts(profile_id,caption,hashtags_json,status,scheduled_at,published_at,post_type,created_at,updated_at,manually_edited_caption,ai_generated,asset_path,platform) SELECT profile_id,caption,hashtags_json,'needs_review',scheduled_at,NULL,post_type,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,0,ai_generated,asset_path,'tiktok' FROM posts WHERE id=?", [instagram_post_id]).map_err(|e|e.to_string())?;
             let tiktok_post_id = tx.last_insert_rowid();
+            copied_post_ids.push(tiktok_post_id);
             tx.execute("INSERT INTO post_images(post_id,image_id,position) SELECT ?,image_id,position FROM post_images WHERE post_id=?", params![tiktok_post_id,instagram_post_id]).map_err(|e|e.to_string())?;
         }
     }
+    // A copy inherits its parent's type, so a Facebook copy of a carousel is as
+    // unpublishable as the carousel. Stand those down too, scoped strictly to
+    // the posts this run created.
+    for post_id in &copied_post_ids {
+        tx.execute(
+            &format!("UPDATE posts SET status='draft',scheduled_at=NULL WHERE id=? AND NOT {PUBLISHABLE_SQL}"),
+            [post_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // Reflow last, so the slots go to the posts that can actually use them —
+    // including the TikTok copies, whose Instagram parents are now drafts.
+    reflow_wedding_rotation(&tx, start, posts_per_day.clamp(1, 5))?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(campaign_id)
 }
@@ -1447,7 +1536,7 @@ fn reflow_wedding_rotation(
     posts_per_day: u32,
 ) -> Result<(), String> {
     let wedding_ids = tx
-        .prepare("SELECT w.id FROM weddings w WHERE EXISTS(SELECT 1 FROM posts p JOIN post_images pi ON pi.post_id=p.id JOIN images i ON i.id=pi.image_id WHERE i.collection_id=w.collection_id AND p.status IN ('draft','needs_review','approved','scheduled')) ORDER BY w.created_at,w.id")
+        .prepare(&format!("SELECT w.id FROM weddings w WHERE EXISTS(SELECT 1 FROM posts p JOIN post_images pi ON pi.post_id=p.id JOIN images i ON i.id=pi.image_id WHERE i.collection_id=w.collection_id AND p.status IN ('draft','needs_review','approved','scheduled') AND p.id IN (SELECT id FROM posts WHERE {PUBLISHABLE_SQL})) ORDER BY w.created_at,w.id"))
         .map_err(|e| e.to_string())?
         .query_map([], |r| r.get::<_, i64>(0))
         .map_err(|e| e.to_string())?
@@ -1456,7 +1545,7 @@ fn reflow_wedding_rotation(
     let mut groups = Vec::new();
     for wedding_id in wedding_ids {
         let post_ids = tx
-            .prepare("SELECT DISTINCT p.id FROM posts p JOIN post_images pi ON pi.post_id=p.id JOIN images i ON i.id=pi.image_id JOIN weddings w ON w.collection_id=i.collection_id WHERE w.id=? AND p.status IN ('draft','needs_review','approved','scheduled') ORDER BY p.id")
+            .prepare(&format!("SELECT DISTINCT p.id FROM posts p JOIN post_images pi ON pi.post_id=p.id JOIN images i ON i.id=pi.image_id JOIN weddings w ON w.collection_id=i.collection_id WHERE w.id=? AND p.status IN ('draft','needs_review','approved','scheduled') AND p.id IN (SELECT id FROM posts WHERE {PUBLISHABLE_SQL}) ORDER BY p.id"))
             .map_err(|e| e.to_string())?
             .query_map([wedding_id], |r| r.get::<_, i64>(0))
             .map_err(|e| e.to_string())?
@@ -2134,7 +2223,8 @@ fn reorder_post_images(
 #[tauri::command]
 fn approve_all(state: State<AppState>) -> Result<usize, String> {
     let c = state.db.lock().unwrap();
-    c.execute("UPDATE posts SET status=CASE WHEN scheduled_at IS NULL THEN 'approved' ELSE 'scheduled' END,updated_at=CURRENT_TIMESTAMP WHERE status IN ('draft','needs_review','approved')",[]).map_err(|e|e.to_string())
+    // Bulk approval must not sweep unpublishable formats into the queue.
+    c.execute(&format!("UPDATE posts SET status=CASE WHEN scheduled_at IS NULL THEN 'approved' ELSE 'scheduled' END,updated_at=CURRENT_TIMESTAMP WHERE status IN ('draft','needs_review','approved') AND {PUBLISHABLE_SQL}"),[]).map_err(|e|e.to_string())
 }
 
 fn insight_metric(payload: &serde_json::Value, name: &str) -> i64 {
@@ -2270,14 +2360,30 @@ fn sync_instagram_insights(state: State<AppState>) -> Result<InsightsSyncResult,
         let plays = insight_metric(&insight_payload, "views");
         let interactions = insight_metric(&insight_payload, "total_interactions");
         let c = state.db.lock().unwrap();
+        // Match on the media ID we recorded at publish time. Fall back to a
+        // caption *prefix*: the publisher appends "\n\n" and the hashtags before
+        // sending, so the remote caption starts with the stored one but is never
+        // equal to it — which is why equality matching linked nothing at all.
         let local_post = c
             .query_row(
-                "SELECT id FROM posts WHERE caption=? ORDER BY id DESC LIMIT 1",
-                [caption],
+                "SELECT id FROM posts WHERE instagram_media_id=? LIMIT 1",
+                [id],
                 |r| r.get::<_, i64>(0),
             )
             .optional()
-            .unwrap_or(None);
+            .unwrap_or(None)
+            .or_else(|| {
+                if caption.is_empty() {
+                    return None;
+                }
+                c.query_row(
+                    "SELECT id FROM posts WHERE caption<>'' AND substr(?,1,length(caption))=caption ORDER BY id DESC LIMIT 1",
+                    [caption],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap_or(None)
+            });
         let section=local_post.and_then(|post_id|c.query_row("SELECT COALESCE(a.sub_category,'') FROM post_images pi JOIN image_analysis a ON a.image_id=pi.image_id WHERE pi.post_id=? ORDER BY pi.position LIMIT 1",[post_id],|r|r.get::<_,String>(0)).ok()).filter(|value|!value.is_empty()).unwrap_or_else(||infer_section(caption));
         c.execute("INSERT INTO instagram_performance(instagram_media_id,local_post_id,caption,post_type,published_at,reach,likes,comments,saves,shares,plays,total_interactions,section,synced_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(instagram_media_id) DO UPDATE SET local_post_id=excluded.local_post_id,caption=excluded.caption,post_type=excluded.post_type,published_at=excluded.published_at,reach=excluded.reach,likes=excluded.likes,comments=excluded.comments,saves=excluded.saves,shares=excluded.shares,plays=excluded.plays,total_interactions=excluded.total_interactions,section=excluded.section,synced_at=CURRENT_TIMESTAMP",params![id,local_post,caption,post_type,published,reach,likes,comments,saves,shares,plays,interactions,section]).map_err(|e|e.to_string())?;
         if let Some(post_id) = local_post {
@@ -2762,6 +2868,88 @@ mod tests {
         assert_eq!(results[0].image_id, 7);
         assert_eq!(results[0].hashtags.len(), 5);
     }
+    #[test]
+    fn fresh_install_has_publish_recovery() {
+        // B3: save_facebook_connection reads this table, so a database that has
+        // never run the Python publisher must still have it.
+        let c = Connection::open_in_memory().unwrap();
+        migrations(&c).unwrap();
+        c.execute(
+            "UPDATE posts SET status='scheduled' WHERE id IN (SELECT post_id FROM publish_recovery WHERE failure_class='authentication')",
+            [],
+        )
+        .expect("the Facebook reconnect statement must not fail on a fresh install");
+    }
+
+    #[test]
+    fn only_shippable_formats_are_publishable() {
+        // B1: the combinations the publisher actually implements.
+        assert!(publishable("instagram", "single"));
+        assert!(publishable("facebook", "single"));
+        assert!(publishable("tiktok", "reel"));
+        for format in ["carousel", "reel", "story_pack"] {
+            assert!(!publishable("instagram", format), "{format} cannot be sent to Instagram");
+        }
+        assert!(!publishable("tiktok", "single"));
+    }
+
+    #[test]
+    fn bulk_approval_leaves_unpublishable_posts_alone() {
+        // B1: approve_all must not sweep a carousel into the queue where it is
+        // certain to fail on its scheduled day.
+        let c = Connection::open_in_memory().unwrap();
+        migrations(&c).unwrap();
+        c.execute("INSERT INTO posts(id,profile_id,status,post_type,platform,scheduled_at)VALUES(1,1,'needs_review','carousel','instagram','2026-08-12 09:00:00')",[]).unwrap();
+        c.execute("INSERT INTO posts(id,profile_id,status,post_type,platform,scheduled_at)VALUES(2,1,'needs_review','single','instagram','2026-08-12 09:00:00')",[]).unwrap();
+        c.execute(&format!("UPDATE posts SET status=CASE WHEN scheduled_at IS NULL THEN 'approved' ELSE 'scheduled' END WHERE status IN ('draft','needs_review','approved') AND {PUBLISHABLE_SQL}"),[]).unwrap();
+        let carousel: String = c.query_row("SELECT status FROM posts WHERE id=1",[],|r|r.get(0)).unwrap();
+        let single: String = c.query_row("SELECT status FROM posts WHERE id=2",[],|r|r.get(0)).unwrap();
+        assert_eq!(carousel, "needs_review");
+        assert_eq!(single, "scheduled");
+    }
+
+    #[test]
+    fn no_children_consent_withholds_unanalysed_photographs() {
+        // B5: absence of evidence is not evidence of absence. An unanalysed
+        // photograph must be withheld, not approved by default.
+        let c = Connection::open_in_memory().unwrap();
+        migrations(&c).unwrap();
+        c.execute("INSERT INTO weddings(id,profile_id,couple_names,consent_level)VALUES(1,1,'A & B','no_children')",[]).unwrap();
+        for id in 1..=3 {
+            c.execute("INSERT INTO images(id,source_path,filename,file_hash,file_size)VALUES(?,?,?,?,0)",params![id,format!("/tmp/{id}.jpg"),format!("{id}.jpg"),format!("hash{id}")]).unwrap();
+        }
+        // 1 = analysed, adults only. 2 = analysed, has a child. 3 = never analysed.
+        c.execute("INSERT INTO image_analysis(image_id,provider,description)VALUES(1,'claude','Two adults laughing during the speeches')",[]).unwrap();
+        c.execute("INSERT INTO image_analysis(image_id,provider,description)VALUES(2,'claude','A small child running past the top table')",[]).unwrap();
+        let safe = marketing_safe_images(&c, 1, vec![1, 2, 3]).unwrap();
+        assert_eq!(safe, vec![1], "only the photograph shown to be adults-only may pass");
+    }
+
+    #[test]
+    fn insights_link_to_posts_despite_appended_hashtags() {
+        // B4: the publisher appends hashtags, so the remote caption is never
+        // equal to the stored one. Prefix matching is what actually links them.
+        let c = Connection::open_in_memory().unwrap();
+        migrations(&c).unwrap();
+        c.execute("INSERT INTO posts(id,profile_id,caption,status)VALUES(1,1,'A room listening.\nThen the punchline landed.','published')",[]).unwrap();
+        let remote = "A room listening.\nThen the punchline landed.\n\n#one #two #three";
+        let linked: Option<i64> = c
+            .query_row(
+                "SELECT id FROM posts WHERE caption<>'' AND substr(?,1,length(caption))=caption ORDER BY id DESC LIMIT 1",
+                [remote],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(linked, Some(1));
+        // And equality — the old behaviour — still links nothing, which is the defect.
+        let by_equality: Option<i64> = c
+            .query_row("SELECT id FROM posts WHERE caption=? LIMIT 1", [remote], |r| r.get(0))
+            .optional()
+            .unwrap();
+        assert_eq!(by_equality, None);
+    }
+
     #[test]
     fn status_constraint_rejects_unknown() {
         let c = Connection::open_in_memory().unwrap();

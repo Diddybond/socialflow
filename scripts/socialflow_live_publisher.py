@@ -50,6 +50,13 @@ def ensure_recovery_schema(db: sqlite3.Connection) -> None:
 def classify_failure(error: Exception) -> tuple[str, bool, str]:
     message = str(error)
     lower = message.lower()
+    # A format the publisher does not implement is permanent, not transient.
+    # Retrying it eight times over eleven hours told the photographer their
+    # network was flaky when in fact the post could never have been sent.
+    if "accepts single photographs only" in lower or "reel, generated video or connected account" in lower:
+        return ("unsupported_format", False,
+                "SocialFlow cannot publish this format yet. The rendered asset is ready to post by hand; "
+                "this post has been moved out of the queue so it stops retrying.")
     # Meta uses the generic OAuthException type for media-fetch failures too.
     # These are not authentication failures: the short-lived public URL can
     # need a few seconds before every Cloudflare edge serves the photograph.
@@ -90,7 +97,15 @@ def schedule_recovery(post_id: int, error: Exception) -> None:
     requires_action = not retryable or (failure_class == "provider" and retries >= 8)
     delays = [60, 180, 600, 1800, 3600, 10800, 21600]
     retry_at = None if requires_action else datetime.now() + timedelta(seconds=delays[min(retries - 1, len(delays) - 1)])
-    status = "failed" if requires_action else "scheduled"
+    # An unpublishable format is not a failed post — the photographs and the
+    # rendered asset are fine. Return it to draft so it leaves the queue
+    # cleanly instead of sitting in the failed pile implying something broke.
+    if failure_class == "unsupported_format":
+        status = "draft"
+    elif requires_action:
+        status = "failed"
+    else:
+        status = "scheduled"
     db.execute("UPDATE posts SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, post_id))
     db.execute(
         """INSERT INTO publish_recovery(post_id,failure_class,retry_count,next_retry_at,requires_action,resolution_hint,last_error,updated_at)
