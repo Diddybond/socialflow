@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SocialFlow",
+  "version": "0.1.0",
+  "identifier": "com.socialflow.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPDATA/**", "$APPCACHE/**", "**"]
+      }
+    },
+    "windows": [
+      {
+        "title": "SocialFlow",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "decorations": true,
+        "transparent": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": ["icons/icon.icns", "icons/icon.png"],
+    "category": "Photography",
+    "shortDescription": "Photography-first Instagram campaign planning",
+    "longDescription": "A local-first macOS application for professional photographers to curate, schedule and publish campaigns.",
+    "macOS": { "minimumSystemVersion": "11.0" }
+  }
+}

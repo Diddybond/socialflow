@@ -1,0 +1,2 @@
+import {describe,it,expect}from'vitest';import{allocateSlots,parseHashtags,validateAnalysis}from'./lib';
+describe('hashtags',()=>it('deduplicates',()=>expect(parseHashtags('#Wedding #wedding #London')).toEqual(['#wedding','#london'])));describe('slots',()=>it('allocates configured weekdays',()=>expect(allocateSlots(new Date('2026-08-03T10:00:00'),3).map(x=>x.getDay())).toEqual([1,3,5])));describe('AI schema',()=>it('rejects malformed output',()=>expect(()=>validateAnalysis({description:'x'})).toThrow()));

@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+"""Publish due SocialFlow single-image posts through Meta's official APIs.
+
+Local photographs are exposed through a random, short-lived Cloudflare URL only
+for the few seconds Meta needs to copy them. Tokens remain in macOS Keychain.
+"""
+from __future__ import annotations
+
+import argparse
+import http.server
+import json
+import mimetypes
+import os
+import re
+import secrets
+import signal
+import sqlite3
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
+from pathlib import Path
+
+DB = Path.home() / "Library/Application Support/com.socialflow.desktop/socialflow.db"
+CLOUDFLARED = "/usr/local/opt/cloudflared/bin/cloudflared"
+
+
+def ensure_recovery_schema(db: sqlite3.Connection) -> None:
+    """Durable retry state so recovery survives app and Mac restarts."""
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS publish_recovery(
+          post_id INTEGER PRIMARY KEY REFERENCES posts(id) ON DELETE CASCADE,
+          failure_class TEXT NOT NULL,
+          retry_count INTEGER NOT NULL DEFAULT 0,
+          next_retry_at TEXT,
+          requires_action INTEGER NOT NULL DEFAULT 0,
+          resolution_hint TEXT DEFAULT '',
+          last_error TEXT DEFAULT '',
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    db.commit()
+
+
+def classify_failure(error: Exception) -> tuple[str, bool, str]:
+    message = str(error)
+    lower = message.lower()
+    # Meta uses the generic OAuthException type for media-fetch failures too.
+    # These are not authentication failures: the short-lived public URL can
+    # need a few seconds before every Cloudflare edge serves the photograph.
+    if any(marker in lower for marker in (
+        '"code":9004', '"code": 9004', '"error_subcode":2207052',
+        '"error_subcode": 2207052', 'only photo or video can be accepted',
+    )):
+        return "temporary", True, "SocialFlow is refreshing the secure photograph link and retrying automatically."
+    # Authentication and permission changes require Meta's signed-in approval.
+    if any(marker in lower for marker in (
+        '"code":190', '"code": 190', 'oauth', 'access token', 'session has expired',
+        'permission(s)', 'insufficient permission', 'not authorized',
+    )):
+        return "authentication", False, "Reconnect this account in Settings; SocialFlow will resume the post afterwards."
+    if any(marker in lower for marker in (
+        "original photograph is unavailable", "post or connected", "post, photograph or connected",
+    )):
+        return "content", False, "Open the affected post and restore its photograph or account connection."
+    if any(marker in lower for marker in (
+        "timed out", "timeout", "temporar", "tunnel", "connection", "network",
+        "http error 429", "http error 500", "http error 502", "http error 503", "http error 504",
+        "did not finish copying",
+    )):
+        return "temporary", True, "SocialFlow is retrying automatically."
+    # Unknown provider failures get several increasingly spaced retries before
+    # asking for attention; this catches short-lived API changes safely.
+    return "provider", True, "SocialFlow is retrying automatically and preserving the post."
+
+
+def schedule_recovery(post_id: int, error: Exception) -> None:
+    db = sqlite3.connect(DB)
+    ensure_recovery_schema(db)
+    failure_class, retryable, hint = classify_failure(error)
+    previous = db.execute("SELECT retry_count FROM publish_recovery WHERE post_id=?", (post_id,)).fetchone()
+    retries = (previous[0] if previous else 0) + 1
+    # Unknown failures are promoted to action-required after eight attempts;
+    # known temporary failures continue recovering indefinitely at a safe pace.
+    requires_action = not retryable or (failure_class == "provider" and retries >= 8)
+    delays = [60, 180, 600, 1800, 3600, 10800, 21600]
+    retry_at = None if requires_action else datetime.now() + timedelta(seconds=delays[min(retries - 1, len(delays) - 1)])
+    status = "failed" if requires_action else "scheduled"
+    db.execute("UPDATE posts SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, post_id))
+    db.execute(
+        """INSERT INTO publish_recovery(post_id,failure_class,retry_count,next_retry_at,requires_action,resolution_hint,last_error,updated_at)
+           VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+           ON CONFLICT(post_id) DO UPDATE SET failure_class=excluded.failure_class,retry_count=excluded.retry_count,
+           next_retry_at=excluded.next_retry_at,requires_action=excluded.requires_action,
+           resolution_hint=excluded.resolution_hint,last_error=excluded.last_error,updated_at=CURRENT_TIMESTAMP""",
+        (post_id, failure_class, retries, retry_at.isoformat(sep=" ") if retry_at else None,
+         int(requires_action), hint, str(error)[:4000]),
+    )
+    if requires_action:
+        summary = f"Post {post_id} needs attention: {hint}"
+        db.execute("INSERT INTO app_settings(key,value)VALUES('publisher_action_required',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (summary,))
+    db.commit()
+    db.close()
+
+
+def clear_recovery(post_id: int) -> None:
+    db = sqlite3.connect(DB)
+    ensure_recovery_schema(db)
+    db.execute("DELETE FROM publish_recovery WHERE post_id=?", (post_id,))
+    remaining = db.execute("SELECT COUNT(*) FROM publish_recovery WHERE requires_action=1").fetchone()[0]
+    if not remaining:
+        db.execute("DELETE FROM app_settings WHERE key='publisher_action_required'")
+    db.commit()
+    db.close()
+
+
+def api(url: str, token: str, data: dict[str, str] | None = None) -> dict:
+    encoded = urllib.parse.urlencode(data).encode() if data is not None else None
+    request = urllib.request.Request(url, data=encoded)
+    request.add_header("Authorization", f"Bearer {token}")
+    request.add_header("User-Agent", "SocialFlow/0.1")
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            return json.loads(response.read())
+    except Exception as error:
+        detail = getattr(error, "read", lambda: b"")().decode(errors="replace")
+        raise RuntimeError(detail or str(error)) from error
+
+
+def refresh_instagram_token_if_needed() -> None:
+    """Refresh a long-lived Instagram token before its 60-day window closes."""
+    db = sqlite3.connect(DB)
+    row = db.execute("SELECT instagram_user_id,token_expiry FROM instagram_accounts WHERE connected=1 ORDER BY id DESC LIMIT 1").fetchone()
+    if not row:
+        db.close()
+        return
+    account_id, expiry_text = row
+    try:
+        expiry = datetime.fromisoformat((expiry_text or "").replace("Z", "+00:00")).replace(tzinfo=None)
+        if expiry > datetime.now() + timedelta(days=7):
+            db.close()
+            return
+    except ValueError:
+        pass
+    token = subprocess.check_output(
+        ["/usr/bin/security", "find-generic-password", "-s", "com.socialflow.desktop.instagram", "-a", account_id, "-w"], text=True
+    ).strip()
+    url = "https://graph.instagram.com/refresh_access_token?" + urllib.parse.urlencode({"grant_type": "ig_refresh_token", "access_token": token})
+    with urllib.request.urlopen(url, timeout=45) as response:
+        result = json.loads(response.read())
+    refreshed = result.get("access_token")
+    if not refreshed:
+        raise RuntimeError(f"Instagram did not return a refreshed token: {json.dumps(result)}")
+    subprocess.run(["/usr/bin/security", "add-generic-password", "-U", "-s", "com.socialflow.desktop.instagram", "-a", account_id, "-w", refreshed], check=True, stdout=subprocess.DEVNULL)
+    os.environ["SOCIALFLOW_IG_TOKEN"] = refreshed
+    expires = datetime.now() + timedelta(seconds=int(result.get("expires_in", 5184000)))
+    db.execute("UPDATE instagram_accounts SET token_expiry=?,last_successful_request=CURRENT_TIMESTAMP WHERE instagram_user_id=?", (expires.isoformat(), account_id))
+    db.commit()
+    db.close()
+
+
+def refresh_tiktok_token() -> None:
+    db=sqlite3.connect(DB)
+    row=db.execute("SELECT ta.open_id,(SELECT value FROM app_settings WHERE key='tiktok_client_key') FROM tiktok_accounts ta WHERE ta.connected=1 LIMIT 1").fetchone()
+    db.close()
+    if not row: return
+    open_id,client_key=row
+    refresh=subprocess.check_output(["/usr/bin/security","find-generic-password","-s","com.socialflow.desktop.tiktok.refresh","-a",open_id,"-w"],text=True).strip()
+    secret=subprocess.check_output(["/usr/bin/security","find-generic-password","-s","com.socialflow.desktop.tiktok.client","-a",client_key,"-w"],text=True).strip()
+    payload=urllib.parse.urlencode({"client_key":client_key,"client_secret":secret,"grant_type":"refresh_token","refresh_token":refresh}).encode()
+    request=urllib.request.Request("https://open.tiktokapis.com/v2/oauth/token/",data=payload,method="POST"); request.add_header("Content-Type","application/x-www-form-urlencoded")
+    with urllib.request.urlopen(request,timeout=45) as response: result=json.loads(response.read())
+    if result.get("error"): raise RuntimeError(result.get("error_description",result["error"]))
+    for service,password in [("com.socialflow.desktop.tiktok",result["access_token"]),("com.socialflow.desktop.tiktok.refresh",result["refresh_token"])]:
+        subprocess.run(["/usr/bin/security","add-generic-password","-U","-s",service,"-a",open_id,"-w",password],check=True,stdout=subprocess.DEVNULL)
+
+
+class OneImage(http.server.BaseHTTPRequestHandler):
+    path_token = ""
+    image_path = Path()
+
+    def do_GET(self) -> None:
+        if self.path.split("?", 1)[0] != f"/{self.path_token}":
+            self.send_error(404)
+            return
+        content = self.image_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(self.image_path.name)[0] or "image/jpeg")
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(content)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+def temporary_url(image_path: Path):
+    OneImage.path_token = secrets.token_urlsafe(32) + image_path.suffix.lower()
+    OneImage.image_path = image_path
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), OneImage)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    last_error = ""
+    # Quick tunnels occasionally receive an edge hostname whose DNS record is
+    # not usable. Replace that tunnel automatically instead of failing a post.
+    for _attempt in range(3):
+        tunnel = subprocess.Popen(
+            [CLOUDFLARED, "tunnel", "--url", f"http://127.0.0.1:{server.server_port}", "--no-autoupdate"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.time() + 35
+        public = ""
+        while time.time() < deadline:
+            line = tunnel.stderr.readline() if tunnel.stderr else ""
+            match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+            if match:
+                public = match.group(0)
+                break
+            if tunnel.poll() is not None:
+                break
+        if public:
+            media_url = f"{public}/{OneImage.path_token}"
+            readiness_deadline = time.time() + 35
+            while time.time() < readiness_deadline:
+                check = subprocess.run(
+                    ["/usr/bin/curl", "--silent", "--show-error", "--fail", "--location",
+                     "--max-time", "12", "--output", "/dev/null", "--write-out", "%{http_code} %{content_type}", media_url],
+                    capture_output=True,
+                    text=True,
+                )
+                status = check.stdout.strip()
+                if check.returncode == 0 and status.startswith("200 image/"):
+                    return media_url, server, tunnel
+                last_error = check.stderr.strip() or status or "public edge not ready"
+                time.sleep(2)
+        else:
+            last_error = "quick tunnel did not provide a public address"
+        tunnel.terminate()
+        try:
+            tunnel.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            tunnel.kill()
+    server.shutdown()
+    raise RuntimeError(f"Temporary secure media link was not ready after automatic tunnel replacement: {last_error}")
+
+
+def instagram_ready_copy(source: Path, folder: Path) -> Path:
+    """Create a standard-size sRGB JPEG without altering the photographer's file."""
+    output = folder / "socialflow-instagram.jpg"
+    result = subprocess.run(
+        [
+            "/usr/bin/sips",
+            "-s", "format", "jpeg",
+            "-s", "formatOptions", "92",
+            "-s", "profile", "/System/Library/ColorSync/Profiles/sRGB Profile.icc",
+            "--resampleWidth", "1440",
+            str(source),
+            "--out", str(output),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
+        raise RuntimeError(f"Could not prepare an Instagram-compatible JPEG: {result.stderr.strip()}")
+    return output
+
+
+def facebook_cdn_url_for_image(db: sqlite3.Connection, image_id: int) -> str:
+    """Reuse Meta's own CDN when the same photograph is already on the Page."""
+    mirror = db.execute(
+        """SELECT fp.facebook_post_id,fa.page_id FROM posts fp
+           JOIN post_images fpi ON fpi.post_id=fp.id AND fpi.image_id=?
+           JOIN facebook_accounts fa ON fa.profile_id=fp.profile_id AND fa.connected=1
+           WHERE fp.platform='facebook' AND fp.status='published' AND fp.facebook_post_id IS NOT NULL
+           ORDER BY fp.published_at DESC LIMIT 1""", (image_id,)
+    ).fetchone()
+    if not mirror:
+        raise RuntimeError("No published Facebook copy is available as a secure Meta media fallback")
+    token = subprocess.check_output(
+        ["/usr/bin/security", "find-generic-password", "-s", "com.socialflow.desktop.facebook", "-a", mirror["page_id"], "-w"], text=True
+    ).strip()
+    result = api(
+        f"https://graph.facebook.com/v23.0/{mirror['facebook_post_id']}?fields=full_picture&access_token={urllib.parse.quote(token)}",
+        token,
+    )
+    url = result.get("full_picture")
+    if not url:
+        raise RuntimeError("Facebook returned no CDN photograph for the published Page post")
+    return url
+
+
+def publish_instagram(post_id: int) -> None:
+    db = sqlite3.connect(DB)
+    db.row_factory = sqlite3.Row
+    row = db.execute(
+        """SELECT p.id,p.caption,p.hashtags_json,p.post_type,i.id image_id,i.source_path,
+                  ia.instagram_user_id
+           FROM posts p JOIN post_images pi ON pi.post_id=p.id AND pi.position=0
+           JOIN images i ON i.id=pi.image_id
+           JOIN instagram_accounts ia ON ia.profile_id=p.profile_id AND ia.connected=1
+           WHERE p.id=? AND COALESCE(p.platform,'instagram')='instagram'""",
+        (post_id,),
+    ).fetchone()
+    if not row:
+        raise RuntimeError("Post or connected Instagram account was not found")
+    if row["post_type"] != "single":
+        raise RuntimeError("Today's safe publisher currently accepts single photographs only")
+    original = Path(row["source_path"])
+    if not original.is_file():
+        raise RuntimeError(f"Original photograph is unavailable: {original.name}")
+    token = os.environ.get("SOCIALFLOW_IG_TOKEN", "").strip()
+    if not token:
+        token = subprocess.check_output(
+            ["/usr/bin/security", "find-generic-password", "-s", "com.socialflow.desktop.instagram", "-a", row["instagram_user_id"], "-w"],
+            text=True,
+        ).strip()
+    tags = " ".join(json.loads(row["hashtags_json"] or "[]"))
+    caption = row["caption"].rstrip() + ("\n\n" + tags if tags else "")
+    db.execute("UPDATE posts SET status='publishing',updated_at=CURRENT_TIMESTAMP WHERE id=?", (post_id,))
+    db.execute("INSERT INTO publish_attempts(post_id,started_at,status) VALUES(?,CURRENT_TIMESTAMP,'publishing')", (post_id,))
+    attempt = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    db.commit()
+    server = tunnel = None
+    temporary = tempfile.TemporaryDirectory(prefix="socialflow-instagram-")
+    try:
+        image = instagram_ready_copy(original, Path(temporary.name))
+        try:
+            image_url, server, tunnel = temporary_url(image)
+        except Exception:
+            image_url = facebook_cdn_url_for_image(db, row["image_id"])
+        container = api(
+            f"https://graph.instagram.com/{row['instagram_user_id']}/media",
+            token,
+            {"image_url": image_url, "caption": caption},
+        )["id"]
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            status = api(
+                f"https://graph.instagram.com/{container}?fields=status_code,status&access_token={urllib.parse.quote(token)}",
+                token,
+            )
+            if status.get("status_code") == "FINISHED":
+                break
+            if status.get("status_code") in {"ERROR", "EXPIRED"}:
+                raise RuntimeError(status.get("status") or status["status_code"])
+            time.sleep(4)
+        else:
+            raise RuntimeError("Instagram did not finish copying the photograph in time")
+        media_id = api(
+            f"https://graph.instagram.com/{row['instagram_user_id']}/media_publish",
+            token,
+            {"creation_id": container},
+        )["id"]
+        db.execute("UPDATE posts SET status='published',instagram_media_id=?,published_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?", (media_id, post_id))
+        db.execute("UPDATE images SET used_count=used_count+1,last_used_at=CURRENT_TIMESTAMP WHERE id=?", (row["image_id"],))
+        db.execute("UPDATE publish_attempts SET finished_at=CURRENT_TIMESTAMP,status='published',provider_response=? WHERE id=?", (json.dumps({"media_id": media_id}), attempt))
+        db.commit()
+    except Exception as error:
+        db.execute("UPDATE posts SET status='failed',updated_at=CURRENT_TIMESTAMP WHERE id=?", (post_id,))
+        db.execute("UPDATE publish_attempts SET finished_at=CURRENT_TIMESTAMP,status='failed',error_message=? WHERE id=?", (str(error), attempt))
+        db.commit()
+        raise
+    finally:
+        if tunnel:
+            tunnel.terminate()
+            try:
+                tunnel.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                tunnel.kill()
+        if server:
+            server.shutdown()
+        temporary.cleanup()
+        db.close()
+
+
+def publish_facebook(post_id: int) -> None:
+    db = sqlite3.connect(DB)
+    db.row_factory = sqlite3.Row
+    row = db.execute(
+        """SELECT p.id,p.caption,p.hashtags_json,i.id image_id,i.source_path,fa.page_id
+           FROM posts p JOIN post_images pi ON pi.post_id=p.id AND pi.position=0
+           JOIN images i ON i.id=pi.image_id
+           JOIN facebook_accounts fa ON fa.profile_id=p.profile_id AND fa.connected=1
+           WHERE p.id=? AND p.platform='facebook'""",
+        (post_id,),
+    ).fetchone()
+    if not row:
+        raise RuntimeError("Post, photograph or connected Facebook Page was not found")
+    image = Path(row["source_path"])
+    if not image.is_file():
+        raise RuntimeError(f"Original photograph is unavailable: {image.name}")
+    token = subprocess.check_output(
+        ["/usr/bin/security", "find-generic-password", "-s", "com.socialflow.desktop.facebook", "-a", row["page_id"], "-w"],
+        text=True,
+    ).strip()
+    tags = " ".join(json.loads(row["hashtags_json"] or "[]"))
+    message = row["caption"].rstrip() + ("\n\n" + tags if tags else "")
+    db.execute("UPDATE posts SET status='publishing',updated_at=CURRENT_TIMESTAMP WHERE id=?", (post_id,))
+    db.execute("INSERT INTO publish_attempts(post_id,started_at,status) VALUES(?,CURRENT_TIMESTAMP,'publishing')", (post_id,))
+    attempt = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    db.commit()
+    try:
+        boundary = "----SocialFlow" + secrets.token_hex(16)
+        content_type = mimetypes.guess_type(image.name)[0] or "image/jpeg"
+        body = bytearray()
+        body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"message\"\r\n\r\n{message}\r\n".encode())
+        body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"source\"; filename=\"{image.name}\"\r\nContent-Type: {content_type}\r\n\r\n".encode())
+        body.extend(image.read_bytes())
+        body.extend(f"\r\n--{boundary}--\r\n".encode())
+        request = urllib.request.Request(
+            f"https://graph.facebook.com/v23.0/{row['page_id']}/photos",
+            data=bytes(body),
+            method="POST",
+        )
+        request.add_header("Authorization", f"Bearer {token}")
+        request.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        request.add_header("User-Agent", "SocialFlow/0.1")
+        with urllib.request.urlopen(request, timeout=120) as response:
+            result = json.loads(response.read())
+        external_id = result.get("post_id") or result.get("id")
+        if not external_id:
+            raise RuntimeError("Facebook accepted the request but returned no post ID")
+        db.execute("UPDATE posts SET status='published',facebook_post_id=?,published_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?", (str(external_id), post_id))
+        db.execute("UPDATE images SET used_count=used_count+1,last_used_at=CURRENT_TIMESTAMP WHERE id=?", (row["image_id"],))
+        db.execute("UPDATE publish_attempts SET finished_at=CURRENT_TIMESTAMP,status='published',provider_response=? WHERE id=?", (json.dumps(result), attempt))
+        db.commit()
+    except Exception as error:
+        detail = getattr(error, "read", lambda: b"")().decode(errors="replace")
+        message = detail or str(error)
+        db.execute("UPDATE posts SET status='failed',updated_at=CURRENT_TIMESTAMP WHERE id=?", (post_id,))
+        db.execute("UPDATE publish_attempts SET finished_at=CURRENT_TIMESTAMP,status='failed',error_message=? WHERE id=?", (message, attempt))
+        db.commit()
+        raise RuntimeError(message) from error
+    finally:
+        db.close()
+
+
+def publish_tiktok(post_id: int) -> None:
+    db = sqlite3.connect(DB)
+    db.row_factory = sqlite3.Row
+    row = db.execute(
+        """SELECT p.id,p.caption,p.hashtags_json,p.asset_path,ta.open_id,
+                  COALESCE((SELECT value FROM app_settings WHERE key='tiktok_publish_mode'),'draft') mode
+           FROM posts p JOIN tiktok_accounts ta ON ta.profile_id=p.profile_id AND ta.connected=1
+           WHERE p.id=? AND p.platform='tiktok' AND p.post_type='reel'""", (post_id,)
+    ).fetchone()
+    if not row or not row["asset_path"]:
+        raise RuntimeError("TikTok Reel, generated video or connected account was not found")
+    video = Path(row["asset_path"])
+    if not video.is_file():
+        raise RuntimeError(f"TikTok video is unavailable: {video.name}")
+    token = subprocess.check_output(
+        ["/usr/bin/security", "find-generic-password", "-s", "com.socialflow.desktop.tiktok", "-a", row["open_id"], "-w"], text=True
+    ).strip()
+    tags = " ".join(json.loads(row["hashtags_json"] or "[]"))
+    title = (row["caption"].rstrip() + ("\n\n" + tags if tags else ""))[:2200]
+    direct = row["mode"] == "direct"
+    endpoint = "https://open.tiktokapis.com/v2/post/publish/video/init/" if direct else "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
+    size = video.stat().st_size
+    payload = {"source_info": {"source": "FILE_UPLOAD", "video_size": size, "chunk_size": size, "total_chunk_count": 1}}
+    if direct:
+        payload["post_info"] = {"title": title, "privacy_level": "SELF_ONLY", "disable_duet": True, "disable_comment": False, "disable_stitch": True, "video_cover_timestamp_ms": 1000}
+    db.execute("UPDATE posts SET status='publishing',updated_at=CURRENT_TIMESTAMP WHERE id=?", (post_id,))
+    db.execute("INSERT INTO publish_attempts(post_id,started_at,status) VALUES(?,CURRENT_TIMESTAMP,'publishing')", (post_id,))
+    attempt = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    db.commit()
+    try:
+        request = urllib.request.Request(endpoint, data=json.dumps(payload).encode(), method="POST")
+        request.add_header("Authorization", f"Bearer {token}")
+        request.add_header("Content-Type", "application/json; charset=UTF-8")
+        with urllib.request.urlopen(request, timeout=60) as response:
+            result = json.loads(response.read())
+        if result.get("error", {}).get("code") not in (None, "ok"):
+            raise RuntimeError(json.dumps(result["error"]))
+        upload_url = result.get("data", {}).get("upload_url")
+        publish_id = result.get("data", {}).get("publish_id")
+        if not upload_url or not publish_id:
+            raise RuntimeError(f"TikTok returned no upload address: {json.dumps(result)}")
+        upload = urllib.request.Request(upload_url, data=video.read_bytes(), method="PUT")
+        upload.add_header("Content-Type", "video/mp4")
+        upload.add_header("Content-Length", str(size))
+        upload.add_header("Content-Range", f"bytes 0-{size - 1}/{size}")
+        with urllib.request.urlopen(upload, timeout=300):
+            pass
+        final_status = "SENT_TO_TIKTOK" if not direct else "PROCESSING_UPLOAD"
+        if direct:
+            deadline = time.time() + 300
+            while time.time() < deadline:
+                status_request = urllib.request.Request(
+                    "https://open.tiktokapis.com/v2/post/publish/status/fetch/",
+                    data=json.dumps({"publish_id": publish_id}).encode(), method="POST",
+                )
+                status_request.add_header("Authorization", f"Bearer {token}")
+                status_request.add_header("Content-Type", "application/json; charset=UTF-8")
+                with urllib.request.urlopen(status_request, timeout=45) as response:
+                    status = json.loads(response.read())
+                final_status = status.get("data", {}).get("status", final_status)
+                if final_status == "PUBLISH_COMPLETE":
+                    break
+                if final_status in {"FAILED", "PUBLISH_FAILED"}:
+                    raise RuntimeError(json.dumps(status))
+                time.sleep(10)
+            else:
+                raise RuntimeError("TikTok did not finish processing the video in time; SocialFlow will check again automatically")
+        db.execute("UPDATE posts SET status='published',tiktok_publish_id=?,published_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?", (publish_id, post_id))
+        db.execute("UPDATE publish_attempts SET finished_at=CURRENT_TIMESTAMP,status='published',provider_response=? WHERE id=?", (json.dumps({"publish_id": publish_id, "status": final_status, "mode": row["mode"]}), attempt))
+        db.commit()
+    except Exception as error:
+        detail = getattr(error, "read", lambda: b"")().decode(errors="replace")
+        message = detail or str(error)
+        db.execute("UPDATE posts SET status='failed',updated_at=CURRENT_TIMESTAMP WHERE id=?", (post_id,))
+        db.execute("UPDATE publish_attempts SET finished_at=CURRENT_TIMESTAMP,status='failed',error_message=? WHERE id=?", (message, attempt))
+        db.commit()
+        raise RuntimeError(message) from error
+    finally:
+        db.close()
+
+
+def publish(post_id: int) -> None:
+    db = sqlite3.connect(DB)
+    row = db.execute("SELECT COALESCE(platform,'instagram') FROM posts WHERE id=?", (post_id,)).fetchone()
+    db.close()
+    if not row:
+        raise RuntimeError("Post was not found")
+    if row[0] == "facebook":
+        publish_facebook(post_id)
+    elif row[0] == "tiktok":
+        publish_tiktok(post_id)
+    else:
+        publish_instagram(post_id)
+    clear_recovery(post_id)
+
+
+def run_due() -> None:
+    try:
+        refresh_instagram_token_if_needed()
+    except Exception as error:
+        # Publishing recovery will surface an expired token if renewal really
+        # becomes necessary; a temporary refresh outage must not stop Facebook.
+        print(f"Instagram token refresh deferred: {error}", flush=True)
+    try:
+        refresh_tiktok_token()
+    except Exception as error:
+        print(f"TikTok token refresh deferred: {error}",flush=True)
+    startup = sqlite3.connect(DB)
+    ensure_recovery_schema(startup)
+    # A terminated process must never strand a post in "publishing".
+    startup.execute(
+        "UPDATE posts SET status='scheduled',updated_at=CURRENT_TIMESTAMP "
+        "WHERE status='publishing' AND updated_at < datetime('now','-10 minutes')"
+    )
+    startup.commit()
+    startup.close()
+    while True:
+        db = sqlite3.connect(DB)
+        due = db.execute(
+            """SELECT p.id FROM posts p LEFT JOIN publish_recovery r ON r.post_id=p.id
+               WHERE p.status='scheduled' AND p.scheduled_at<=datetime('now','localtime')
+               AND (r.next_retry_at IS NULL OR r.next_retry_at<=datetime('now','localtime'))
+               ORDER BY p.scheduled_at,p.id"""
+        ).fetchall()
+        db.close()
+        for (post_id,) in due:
+            try:
+                publish(post_id)
+            except Exception as error:
+                schedule_recovery(post_id, error)
+        time.sleep(30)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--post", type=int)
+    parser.add_argument("--due", action="store_true")
+    args = parser.parse_args()
+    if args.post:
+        publish(args.post)
+    else:
+        run_due()

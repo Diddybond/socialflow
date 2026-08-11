@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <rect width="1920" height="1080" fill="#121212"/>
+  <text x="960" y="380" text-anchor="middle" fill="#ffffff" font-family="Arial, sans-serif" font-size="68" font-weight="700">Scopes demonstrated</text>
+  <text x="960" y="500" text-anchor="middle" fill="#d9d2c3" font-family="Arial, sans-serif" font-size="38">user.info.basic · video.list · video.upload · video.publish</text>
+  <text x="960" y="620" text-anchor="middle" fill="#ffffff" font-family="Arial, sans-serif" font-size="42">No video is posted without explicit user approval.</text>
+</svg>

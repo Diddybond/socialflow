@@ -1,0 +1,14 @@
+export type View='Today'|'Library'|'Queue'|'Calendar'|'Campaigns'|'Autopilot'|'Analytics'|'Published'|'Settings';
+export type ImageRecord={id:number;collection_id:number|null;source_path:string;filename:string;width:number|null;height:number|null;orientation:string|null;file_size:number;thumbnail_path:string|null;analysis_status:string;missing:boolean;used_count:number;favourite:boolean;description?:string;category?:string;social_score?:number};
+export type Post={id:number;profile_id:number;caption:string;hashtags:string[];status:string;scheduled_at:string|null;published_at:string|null;post_type:string;platform:'instagram'|'facebook'|'tiktok';facebook_post_id:string|null;tiktok_publish_id:string|null;asset_path:string|null;created_at:string;images:ImageRecord[]};
+export type Profile={id:number;name:string;business_description:string;website:string;default_cta:string;caption_instructions:string};
+export type Collection={id:number;name:string;folder_path:string;profile_id:number};
+export type Wedding={id:number;collection_id:number|null;couple_names:string;wedding_date:string;venue:string;region:string;consent_level:string;embargo_until:string|null;campaign_goal:string;status:string;created_at:string};
+export type Supplier={id:number;wedding_id:number;role:string;name:string;instagram_handle:string;website:string;instagram_confirmed:boolean};
+export type FormatPerformance={format:string;posts:number;average_score:number;average_reach:number};
+export type BrainRecommendation={title:string;recommendation:string;evidence:string;confidence:string};
+export type TimePerformance={hour:number;posts:number;average_score:number;recommended:boolean};
+export type AnalyticsReport={measured_posts:number;last_synced_at:string|null;formats:FormatPerformance[];best_times:TimePerformance[];recommendations:BrainRecommendation[];permission_needed:boolean};
+export type MarketingHealth={leads:number;booked_value:number;failed_posts:number;visual_duplicates_indexed:number;last_backup_at:string|null;token_expiry:string|null};
+export type AppData={images:ImageRecord[];posts:Post[];profiles:Profile[];collections:Collection[];weddings:Wedding[];suppliers:Supplier[];settings:Record<string,string>;analytics:AnalyticsReport;marketing:MarketingHealth};
+export type Analysis={description:string;category:string;subCategory:string;subjects:string[];mood:string[];socialScore:number;visualNotes:string[];captionAngles:string[]};

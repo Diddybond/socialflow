@@ -1,0 +1,23 @@
+<div id="root"><div id="startup-status" style="box-sizing:border-box;min-height:100vh;background:#171717;color:#eee;padding:32px;font:15px -apple-system,BlinkMacSystemFont,sans-serif">Starting SocialFlow…</div></div>
+<script>
+  window.addEventListener('error', function (event) {
+    var root = document.getElementById('root');
+    if (root && document.getElementById('startup-status')) {
+      root.innerHTML = '<div style="box-sizing:border-box;min-height:100vh;background:#171717;color:#eee;padding:32px;font:15px -apple-system,BlinkMacSystemFont,sans-serif"><h2>SocialFlow could not start</h2><p style="color:#ffb4a8;white-space:pre-wrap">' + String(event.message || 'Unknown startup error').replace(/[&<>]/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }) + '</p></div>';
+    }
+  });
+  window.addEventListener('unhandledrejection', function (event) {
+    var root = document.getElementById('root');
+    if (root && document.getElementById('startup-status')) {
+      root.textContent = 'SocialFlow could not start: ' + String(event.reason || 'Unknown startup error');
+    }
+  });
+</script>
+<script type="module">
+  import('/src/main.tsx').catch(function (error) {
+    var root = document.getElementById('root');
+    if (root) {
+      root.innerHTML = '<div style="box-sizing:border-box;min-height:100vh;background:#171717;color:#eee;padding:32px;font:15px -apple-system,BlinkMacSystemFont,sans-serif"><h2>SocialFlow could not start</h2><p style="color:#ffb4a8;white-space:pre-wrap">' + String(error && (error.stack || error.message) || error).replace(/[&<>]/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }) + '</p></div>';
+    }
+  });
+</script>
