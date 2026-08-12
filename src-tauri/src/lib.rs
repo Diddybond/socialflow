@@ -3615,6 +3615,10 @@ fn headless_db() -> Result<(Connection, PathBuf), String> {
         .unwrap_or_else(|_| dirs::cache_dir().unwrap_or_default().join("com.socialflow.desktop").join("thumbnails"));
     let c = Connection::open(&database).map_err(|e| e.to_string())?;
     migrations(&c).map_err(|e| e.to_string())?;
+    if let Some(name) = database.file_name() {
+        println!("database: {}", database.display());
+        let _ = name;
+    }
     Ok((c, cache))
 }
 
@@ -3729,15 +3733,10 @@ pub fn show_strategy(force: bool) -> Result<(), String> {
 /// One wedding a day, five carousels, a Reel and a Story each, starting
 /// tomorrow so nothing is scheduled into the past. Run by a launchd agent.
 pub fn prepare_week_headless() -> Result<(), String> {
-    let data = dirs::data_dir()
-        .ok_or("No Application Support directory")?
-        .join("com.socialflow.desktop");
-    let cache = dirs::cache_dir()
-        .ok_or("No cache directory")?
-        .join("com.socialflow.desktop")
-        .join("thumbnails");
-    let mut c = Connection::open(data.join("socialflow.db")).map_err(|e| e.to_string())?;
-    migrations(&c).map_err(|e| e.to_string())?;
+    // Uses the same opener as every other headless entry point, so a dry run
+    // with SOCIALFLOW_DB genuinely targets the copy. Building its own paths
+    // meant a "test run" silently pointed at the live database.
+    let (mut c, cache) = headless_db()?;
 
     // Do not stack a second week on top of one still running.
     let pending: i64 = c
