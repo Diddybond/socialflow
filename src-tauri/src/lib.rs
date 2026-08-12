@@ -2851,8 +2851,15 @@ fn infer_section(caption: &str) -> String {
 
 #[tauri::command]
 fn sync_instagram_insights(state: State<AppState>) -> Result<InsightsSyncResult, String> {
+    let c = state.db.lock().unwrap();
+    sync_insights(&c)
+}
+
+/// Pull Instagram results into the database. Independent of Tauri so it can run
+/// on a schedule — the brain reasons from this table, and until now it was only
+/// refreshed when somebody opened Analytics and clicked.
+fn sync_insights(c: &Connection) -> Result<InsightsSyncResult, String> {
     let (account_id, token) = {
-        let c = state.db.lock().unwrap();
         let account:String=c.query_row("SELECT instagram_user_id FROM instagram_accounts WHERE profile_id=1 AND connected=1",[],|r|r.get(0)).map_err(|_|"Connect Instagram before syncing analytics".to_string())?;
         let token = keyring::Entry::new("com.socialflow.desktop.instagram", &account)
             .map_err(|e| e.to_string())?
@@ -2943,19 +2950,30 @@ fn sync_instagram_insights(state: State<AppState>) -> Result<InsightsSyncResult,
         let shares = insight_metric(&insight_payload, "shares");
         let plays = insight_metric(&insight_payload, "views");
         let interactions = insight_metric(&insight_payload, "total_interactions");
-        let c = state.db.lock().unwrap();
         // Match on the media ID we recorded at publish time. Fall back to a
         // caption *prefix*: the publisher appends "\n\n" and the hashtags before
         // sending, so the remote caption starts with the stored one but is never
         // equal to it — which is why equality matching linked nothing at all.
         let local_post = c
             .query_row(
-                "SELECT id FROM posts WHERE caption=? ORDER BY id DESC LIMIT 1",
-                [caption],
+                "SELECT id FROM posts WHERE instagram_media_id=? LIMIT 1",
+                [id],
                 |r| r.get::<_, i64>(0),
             )
             .optional()
-            .unwrap_or(None);
+            .unwrap_or(None)
+            .or_else(|| {
+                if caption.is_empty() {
+                    return None;
+                }
+                c.query_row(
+                    "SELECT id FROM posts WHERE caption<>'' AND substr(?,1,length(caption))=caption ORDER BY id DESC LIMIT 1",
+                    [caption],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap_or(None)
+            });
         let section=local_post.and_then(|post_id|c.query_row("SELECT COALESCE(a.sub_category,'') FROM post_images pi JOIN image_analysis a ON a.image_id=pi.image_id WHERE pi.post_id=? ORDER BY pi.position LIMIT 1",[post_id],|r|r.get::<_,String>(0)).ok()).filter(|value|!value.is_empty()).unwrap_or_else(||infer_section(caption));
         c.execute("INSERT INTO instagram_performance(instagram_media_id,local_post_id,caption,post_type,published_at,reach,likes,comments,saves,shares,plays,total_interactions,section,synced_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(instagram_media_id) DO UPDATE SET local_post_id=excluded.local_post_id,caption=excluded.caption,post_type=excluded.post_type,published_at=excluded.published_at,reach=excluded.reach,likes=excluded.likes,comments=excluded.comments,saves=excluded.saves,shares=excluded.shares,plays=excluded.plays,total_interactions=excluded.total_interactions,section=excluded.section,synced_at=CURRENT_TIMESTAMP",params![id,local_post,caption,post_type,published,reach,likes,comments,saves,shares,plays,interactions,section]).map_err(|e|e.to_string())?;
         if let Some(post_id) = local_post {
@@ -2964,7 +2982,6 @@ fn sync_instagram_insights(state: State<AppState>) -> Result<InsightsSyncResult,
         synced += 1;
     }
     let permission_needed = synced > 0 && detailed == 0;
-    let c = state.db.lock().unwrap();
     c.execute("INSERT INTO app_settings(key,value)VALUES('insights_permission',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[if permission_needed{"needed"}else{"granted"}]).map_err(|e|e.to_string())?;
     Ok(InsightsSyncResult {
         synced,
@@ -3320,9 +3337,13 @@ fn ai_strategy(c: &Connection) -> Option<AiStrategy> {
     let model = c
         .query_row("SELECT value FROM app_settings WHERE key='claude_model_strategy'", [], |r| r.get::<_, String>(0))
         .unwrap_or_else(|_| "opus".into());
+    let lessons = c
+        .query_row("SELECT value FROM app_settings WHERE key='ai_last_review'", [], |r| r.get::<_, String>(0))
+        .unwrap_or_default();
     let prompt = format!(
-        "You are the marketing strategist for a documentary wedding photographer in the North West of England, marketing to UK couples planning weddings in Lancashire, Cheshire, Greater Manchester, Merseyside and the Lake District.\n\nDecide next week's Instagram posting strategy from the evidence below.\n\n{}\nConstraints: the publisher supports carousel, reel and story_pack only. Total posts per day must be between 5 and 12. Posting hours must be between 07:00 and 22:00 and there must be at least as many hours as posts per day. Favour formats and hours the evidence supports, but keep enough variety that the account does not become one format. Explain your reasoning in two or three sentences, naming the numbers you relied on.",
-        strategy_evidence(c)
+        "You are the marketing strategist for a documentary wedding photographer in the North West of England, marketing to UK couples planning weddings in Lancashire, Cheshire, Greater Manchester, Merseyside and the Lake District.\n\nDecide next week's Instagram posting strategy from the evidence below.\n\n{}\nConstraints: the publisher supports carousel, reel and story_pack only. Total posts per day must be between 5 and 12. Posting hours must be between 07:00 and 22:00 and there must be at least as many hours as posts per day. Favour formats and hours the evidence supports, but keep enough variety that the account does not become one format. Explain your reasoning in two or three sentences, naming the numbers you relied on.\n\nYour own review of last week:\n{}",
+        strategy_evidence(c),
+        if lessons.is_empty() { "(no review yet)" } else { lessons.as_str() }
     );
     let mut command = Command::new(executable);
     command.arg("--model").arg(model);
@@ -3351,6 +3372,70 @@ fn ai_strategy(c: &Connection) -> Option<AiStrategy> {
         let _ = c.execute("INSERT INTO app_settings(key,value)VALUES('ai_strategy_reasoning',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [strategy.reasoning.clone()]);
     }
     Some(strategy)
+}
+
+/// Open the database the way the scheduled agents do.
+fn headless_db() -> Result<(Connection, PathBuf), String> {
+    let data = dirs::data_dir().ok_or("No Application Support directory")?.join("com.socialflow.desktop");
+    let cache = dirs::cache_dir().ok_or("No cache directory")?.join("com.socialflow.desktop").join("thumbnails");
+    let c = Connection::open(data.join("socialflow.db")).map_err(|e| e.to_string())?;
+    migrations(&c).map_err(|e| e.to_string())?;
+    Ok((c, cache))
+}
+
+/// Refresh Instagram results on a schedule.
+pub fn sync_insights_headless() -> Result<(), String> {
+    let (c, _) = headless_db()?;
+    let result = sync_insights(&c)?;
+    println!("synced {} posts, {} with detailed insights", result.synced, result.detailed);
+    Ok(())
+}
+
+/// Read what actually happened last week and write down the lessons.
+///
+/// A strategy that never checks its own predictions is not learning. This runs
+/// before the weekly strategy call and its conclusions are fed into it.
+pub fn review_last_week() -> Result<(), String> {
+    let (c, _) = headless_db()?;
+    let published: i64 = c
+        .query_row("SELECT COUNT(*) FROM posts WHERE status='published' AND published_at>=datetime('now','-14 days')", [], |r| r.get(0))
+        .unwrap_or(0);
+    if published < 3 {
+        println!("only {published} posts in the last fortnight; too early to review");
+        return Ok(());
+    }
+    let Some(executable) = command_path("claude") else {
+        return Err("Claude is not installed".into());
+    };
+    let model = c
+        .query_row("SELECT value FROM app_settings WHERE key='claude_model_strategy'", [], |r| r.get::<_, String>(0))
+        .unwrap_or_else(|_| "opus".into());
+    let previous = c
+        .query_row("SELECT value FROM app_settings WHERE key='ai_strategy_reasoning'", [], |r| r.get::<_, String>(0))
+        .unwrap_or_default();
+    let mut actuals = String::new();
+    if let Ok(mut statement) = c.prepare("SELECT p.post_type,substr(p.published_at,12,5),COALESCE(ip.reach,0),COALESCE(ip.likes,0),COALESCE(ip.saves,0),COALESCE(ip.section,'') FROM posts p LEFT JOIN instagram_performance ip ON ip.local_post_id=p.id WHERE p.status='published' AND p.published_at>=datetime('now','-14 days') ORDER BY p.published_at DESC LIMIT 40") {
+        if let Ok(rows) = statement.query_map([], |r| Ok(format!("  {} at {} — reach {}, likes {}, saves {}, moment {}\n", r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,i64>(3)?, r.get::<_,i64>(4)?, r.get::<_,String>(5)?))) {
+            for row in rows.filter_map(Result::ok) { actuals.push_str(&row); }
+        }
+    }
+    let prompt = format!(
+        "You are reviewing your own marketing decisions for a North West England wedding photographer.\n\nThe strategy you set last time:\n{previous}\n\nWhat was actually published and how it performed:\n{actuals}\nAggregate evidence:\n{}\n\nWrite a short, blunt review: which of your assumptions held, which were wrong, and what you will change next week. Name specific numbers. If the data is too thin to conclude anything, say so plainly rather than inventing a pattern. Four sentences at most.",
+        strategy_evidence(&c)
+    );
+    let mut command = Command::new(executable);
+    command.arg("--model").arg(model);
+    command.args(["--print", "--permission-mode", "dontAsk", "--no-session-persistence"]);
+    command.arg(prompt);
+    let (success, stdout, stderr) = run_with_timeout(&mut command, StdDuration::from_secs(180))?;
+    if !success {
+        return Err(String::from_utf8_lossy(&stderr).trim().to_string());
+    }
+    let lessons = String::from_utf8_lossy(&stdout).trim().to_string();
+    c.execute("INSERT INTO app_settings(key,value)VALUES('ai_last_review',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [lessons.clone()]).map_err(|e| e.to_string())?;
+    c.execute("INSERT INTO app_settings(key,value)VALUES('ai_last_review_at',strftime('%Y-%m-%d %H:%M','now','localtime')) ON CONFLICT(key) DO UPDATE SET value=excluded.value", []).map_err(|e| e.to_string())?;
+    println!("{lessons}");
+    Ok(())
 }
 
 /// Print the model's strategy without generating anything.
