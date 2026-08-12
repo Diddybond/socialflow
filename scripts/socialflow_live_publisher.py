@@ -87,21 +87,96 @@ def classify_failure(error: Exception) -> tuple[str, bool, str]:
     return "provider", True, "SocialFlow is retrying automatically and preserving the post."
 
 
+DIAGNOSIS_SCHEMA = json.dumps({
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "failure_class": {"type": "string", "enum": ["temporary", "authentication", "content", "unsupported_format", "rate_limit", "provider"]},
+        "retryable": {"type": "boolean"},
+        "retry_in_seconds": {"type": "integer", "minimum": 0, "maximum": 86400},
+        "diagnosis": {"type": "string"},
+        "resolution_hint": {"type": "string"},
+    },
+    "required": ["failure_class", "retryable", "retry_in_seconds", "diagnosis", "resolution_hint"],
+})
+
+
+def ai_diagnose(post_id: int, error: Exception) -> dict | None:
+    """Ask Claude what actually went wrong and whether it is worth retrying.
+
+    Keyword matching cannot tell a permanent Meta policy rejection from a
+    transient fetch failure — it guesses from substrings, which is how a
+    structurally impossible post was retried eight times over eleven hours.
+    Falls back to the keyword classifier when Claude is unavailable.
+    """
+    claude = subprocess.run(["/bin/zsh", "-lc", "command -v claude"], capture_output=True, text=True)
+    if claude.returncode != 0 or not claude.stdout.strip():
+        return None
+    db = sqlite3.connect(DB)
+    db.row_factory = sqlite3.Row
+    row = db.execute(
+        """SELECT p.post_type,COALESCE(p.platform,'instagram') platform,p.asset_path,
+                  (SELECT COUNT(*) FROM post_images WHERE post_id=p.id) photographs,
+                  (SELECT COUNT(*) FROM publish_attempts WHERE post_id=p.id AND status='failed') previous_failures
+           FROM posts p WHERE p.id=?""", (post_id,)).fetchone()
+    model = db.execute("SELECT value FROM app_settings WHERE key='claude_model_diagnosis'").fetchone()
+    db.close()
+    model = model[0] if model else "opus"
+    context = dict(row) if row else {}
+    prompt = (
+        "A scheduled social media post failed to publish. Diagnose it.\n\n"
+        f"Post: {json.dumps(context)}\n\n"
+        f"Error returned by the platform:\n{str(error)[:2000]}\n\n"
+        "Decide the failure class, whether retrying can plausibly succeed without a human, "
+        "and how many seconds to wait before retrying (0 if not retryable). "
+        "A permanent rejection — an unsupported format, a policy refusal, a revoked token, a missing file — "
+        "must NOT be marked retryable, however transient the wording looks. "
+        "Rate limits are retryable but need a long wait. "
+        "Write resolution_hint as one plain sentence for a photographer, naming what to do next."
+    )
+    try:
+        result = subprocess.run(
+            [claude.stdout.strip(), "--model", model, "--print", "--output-format", "json",
+             "--json-schema", DIAGNOSIS_SCHEMA, "--permission-mode", "dontAsk", "--no-session-persistence", prompt],
+            capture_output=True, text=True, timeout=180,
+        )
+        if result.returncode != 0:
+            return None
+        payload = json.loads(result.stdout)
+        out = payload.get("structured_output")
+        if out is None and isinstance(payload.get("result"), str):
+            cleaned = payload["result"].strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            out = json.loads(cleaned)
+        if not isinstance(out, dict) or "failure_class" not in out:
+            return None
+        return out
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        return None
+
+
 def schedule_recovery(post_id: int, error: Exception) -> None:
     db = sqlite3.connect(DB)
     ensure_recovery_schema(db)
-    failure_class, retryable, hint = classify_failure(error)
+    diagnosis = ai_diagnose(post_id, error)
+    if diagnosis:
+        failure_class = diagnosis["failure_class"]
+        retryable = bool(diagnosis["retryable"])
+        hint = diagnosis["resolution_hint"]
+        ai_wait = int(diagnosis.get("retry_in_seconds") or 0)
+    else:
+        failure_class, retryable, hint = classify_failure(error)
+        ai_wait = 0
     previous = db.execute("SELECT retry_count FROM publish_recovery WHERE post_id=?", (post_id,)).fetchone()
     retries = (previous[0] if previous else 0) + 1
     # Unknown failures are promoted to action-required after eight attempts;
     # known temporary failures continue recovering indefinitely at a safe pace.
     requires_action = not retryable or (failure_class == "provider" and retries >= 8)
     delays = [60, 180, 600, 1800, 3600, 10800, 21600]
-    retry_at = None if requires_action else datetime.now() + timedelta(seconds=delays[min(retries - 1, len(delays) - 1)])
+    wait = ai_wait if ai_wait > 0 else delays[min(retries - 1, len(delays) - 1)]
+    retry_at = None if requires_action else datetime.now() + timedelta(seconds=wait)
     # An unpublishable format is not a failed post — the photographs and the
     # rendered asset are fine. Return it to draft so it leaves the queue
     # cleanly instead of sitting in the failed pile implying something broke.
-    if failure_class == "unsupported_format":
+    if failure_class in {"unsupported_format", "content"}:
         status = "draft"
     elif requires_action:
         status = "failed"
@@ -115,7 +190,8 @@ def schedule_recovery(post_id: int, error: Exception) -> None:
            next_retry_at=excluded.next_retry_at,requires_action=excluded.requires_action,
            resolution_hint=excluded.resolution_hint,last_error=excluded.last_error,updated_at=CURRENT_TIMESTAMP""",
         (post_id, failure_class, retries, retry_at.isoformat(sep=" ") if retry_at else None,
-         int(requires_action), hint, str(error)[:4000]),
+         int(requires_action), hint,
+         ((diagnosis["diagnosis"] + "\n\n") if diagnosis else "") + str(error)[:3500]),
     )
     if requires_action:
         summary = f"Post {post_id} needs attention: {hint}"

@@ -711,6 +711,21 @@ fn default_posting_hours(count: usize) -> Vec<u32> {
 }
 
 fn learned_posting_hours(c: &Connection, count: usize) -> Vec<u32> {
+    // Hours chosen by the model this week take precedence over the raw average.
+    if let Ok(chosen) = c.query_row(
+        "SELECT value FROM app_settings WHERE key='ai_posting_hours' AND value<>''",
+        [],
+        |r| r.get::<_, String>(0),
+    ) {
+        let hours = chosen
+            .split(',')
+            .filter_map(|hour| hour.trim().parse::<u32>().ok())
+            .filter(|hour| (6..=23).contains(hour))
+            .collect::<Vec<_>>();
+        if !hours.is_empty() {
+            return hours;
+        }
+    }
     let automatic = c
         .query_row(
             "SELECT value='auto' FROM app_settings WHERE key='posting_time_mode'",
@@ -3245,6 +3260,119 @@ fn publish_post_to_facebook(post_id: i64, state: State<AppState>) -> Result<Stri
         }
     }
 }
+#[derive(Deserialize, Serialize, Clone, Debug)]
+struct AiStrategy {
+    daily_quota: HashMap<String, u32>,
+    posting_hours: Vec<u32>,
+    reasoning: String,
+    confidence: String,
+}
+
+const STRATEGY_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"daily_quota":{"type":"object","additionalProperties":false,"properties":{"carousel":{"type":"integer","minimum":0,"maximum":10},"reel":{"type":"integer","minimum":0,"maximum":5},"story_pack":{"type":"integer","minimum":0,"maximum":5}},"required":["carousel","reel","story_pack"]},"posting_hours":{"type":"array","minItems":3,"maxItems":12,"items":{"type":"integer","minimum":6,"maximum":23}},"reasoning":{"type":"string"},"confidence":{"type":"string","enum":["low","medium","high"]}},"required":["daily_quota","posting_hours","reasoning","confidence"]}"#;
+
+/// Everything measured, as plain text for the model to reason over.
+fn strategy_evidence(c: &Connection) -> String {
+    let mut out = String::new();
+    if let Ok(mut statement) = c.prepare("SELECT post_type,COUNT(*),ROUND(AVG(reach),0),ROUND(AVG(likes),1),ROUND(AVG(saves),1),ROUND(AVG(shares),1) FROM instagram_performance GROUP BY post_type ORDER BY AVG(reach) DESC") {
+        out.push_str("Measured performance by format (posts, avg reach, likes, saves, shares):\n");
+        if let Ok(rows) = statement.query_map([], |r| Ok(format!("  {} — {} posts, reach {}, likes {}, saves {}, shares {}\n", r.get::<_,String>(0)?, r.get::<_,i64>(1)?, r.get::<_,f64>(2)?, r.get::<_,f64>(3)?, r.get::<_,f64>(4)?, r.get::<_,f64>(5)?))) {
+            for row in rows.filter_map(Result::ok) { out.push_str(&row); }
+        }
+    }
+    if let Ok(mut statement) = c.prepare("SELECT CAST(substr(published_at,12,2) AS INTEGER) h,COUNT(*),ROUND(AVG(reach),0) FROM instagram_performance WHERE published_at IS NOT NULL AND length(published_at)>=13 GROUP BY h HAVING COUNT(*)>=2 ORDER BY AVG(reach) DESC LIMIT 10") {
+        out.push_str("\nMeasured performance by hour of day (hour, posts, avg reach):\n");
+        if let Ok(rows) = statement.query_map([], |r| Ok(format!("  {:02}:00 — {} posts, reach {}\n", r.get::<_,i64>(0)?, r.get::<_,i64>(1)?, r.get::<_,f64>(2)?))) {
+            for row in rows.filter_map(Result::ok) { out.push_str(&row); }
+        }
+    }
+    if let Ok(mut statement) = c.prepare("SELECT section,COUNT(*),ROUND(AVG(reach),0) FROM instagram_performance WHERE section<>'' GROUP BY section ORDER BY AVG(reach) DESC LIMIT 8") {
+        out.push_str("\nWedding-day moments by measured reach:\n");
+        if let Ok(rows) = statement.query_map([], |r| Ok(format!("  {} — {} posts, reach {}\n", r.get::<_,String>(0)?, r.get::<_,i64>(1)?, r.get::<_,f64>(2)?))) {
+            for row in rows.filter_map(Result::ok) { out.push_str(&row); }
+        }
+    }
+    out
+}
+
+/// Ask the model for next week's mix and times, from the measured evidence.
+///
+/// Cached for seven days: this is a weekly decision, and re-asking on every
+/// run would spend the subscription for no new information.
+fn ai_strategy(c: &Connection) -> Option<AiStrategy> {
+    let cached: Option<(String, String)> = c
+        .query_row("SELECT (SELECT value FROM app_settings WHERE key='ai_strategy_json'),(SELECT value FROM app_settings WHERE key='ai_strategy_at')", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .ok();
+    if let Some((json, at)) = cached.filter(|(json, _)| !json.is_empty()) {
+        let fresh = chrono::NaiveDateTime::parse_from_str(&at, "%Y-%m-%d %H:%M:%S")
+            .map(|when| (Local::now().naive_local() - when).num_days() < 7)
+            .unwrap_or(false);
+        if fresh {
+            if let Ok(strategy) = serde_json::from_str::<AiStrategy>(&json) {
+                return Some(strategy);
+            }
+        }
+    }
+    let measured: i64 = c.query_row("SELECT COUNT(*) FROM instagram_performance", [], |r| r.get(0)).unwrap_or(0);
+    if measured < 5 {
+        return None;
+    }
+    let executable = command_path("claude")?;
+    let model = c
+        .query_row("SELECT value FROM app_settings WHERE key='claude_model_strategy'", [], |r| r.get::<_, String>(0))
+        .unwrap_or_else(|_| "opus".into());
+    let prompt = format!(
+        "You are the marketing strategist for a documentary wedding photographer in the North West of England, marketing to UK couples planning weddings in Lancashire, Cheshire, Greater Manchester, Merseyside and the Lake District.\n\nDecide next week's Instagram posting strategy from the evidence below.\n\n{}\nConstraints: the publisher supports carousel, reel and story_pack only. Total posts per day must be between 5 and 12. Posting hours must be between 07:00 and 22:00 and there must be at least as many hours as posts per day. Favour formats and hours the evidence supports, but keep enough variety that the account does not become one format. Explain your reasoning in two or three sentences, naming the numbers you relied on.",
+        strategy_evidence(c)
+    );
+    let mut command = Command::new(executable);
+    command.arg("--model").arg(model);
+    command.args(["--print", "--output-format", "json", "--json-schema", STRATEGY_SCHEMA,
+                  "--permission-mode", "dontAsk", "--no-session-persistence"]);
+    command.arg(prompt);
+    let (success, stdout, _) = run_with_timeout(&mut command, StdDuration::from_secs(180)).ok()?;
+    if !success {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&stdout);
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let payload = value
+        .get("structured_output")
+        .cloned()
+        .or_else(|| value.get("result").and_then(|r| r.as_str()).and_then(|r| serde_json::from_str(r.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim()).ok()))
+        .unwrap_or(value);
+    let strategy: AiStrategy = serde_json::from_value(payload).ok()?;
+    let total: u32 = strategy.daily_quota.values().sum();
+    if total < 5 || total > 12 || strategy.posting_hours.len() < total as usize {
+        return None;
+    }
+    if let Ok(json) = serde_json::to_string(&strategy) {
+        let _ = c.execute("INSERT INTO app_settings(key,value)VALUES('ai_strategy_json',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [json]);
+        let _ = c.execute("INSERT INTO app_settings(key,value)VALUES('ai_strategy_at',strftime('%Y-%m-%d %H:%M:%S','now','localtime')) ON CONFLICT(key) DO UPDATE SET value=excluded.value", []);
+        let _ = c.execute("INSERT INTO app_settings(key,value)VALUES('ai_strategy_reasoning',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [strategy.reasoning.clone()]);
+    }
+    Some(strategy)
+}
+
+/// Print the model's strategy without generating anything.
+pub fn show_strategy(force: bool) -> Result<(), String> {
+    let data = dirs::data_dir().ok_or("No Application Support directory")?.join("com.socialflow.desktop");
+    let c = Connection::open(data.join("socialflow.db")).map_err(|e| e.to_string())?;
+    migrations(&c).map_err(|e| e.to_string())?;
+    if force {
+        let _ = c.execute("UPDATE app_settings SET value='' WHERE key='ai_strategy_json'", []);
+    }
+    match ai_strategy(&c) {
+        Some(s) => {
+            println!("confidence : {}", s.confidence);
+            println!("daily mix  : {:?}", s.daily_quota);
+            println!("hours      : {:?}", s.posting_hours);
+            println!("reasoning  : {}", s.reasoning);
+        }
+        None => println!("No AI strategy available; the measured-evidence fallback would be used."),
+    }
+    Ok(())
+}
+
 /// Build the next seven days with no app and no button.
 ///
 /// One wedding a day, five carousels, a Reel and a Story each, starting
@@ -3282,11 +3410,30 @@ pub fn prepare_week_headless() -> Result<(), String> {
     if weddings.is_empty() {
         return Err("No marketing-approved weddings are ready".into());
     }
-    let quota = HashMap::from([
-        ("carousel".to_string(), 5u32),
-        ("reel".to_string(), 1),
-        ("story_pack".to_string(), 1),
-    ]);
+    // The model decides the mix and the hours from measured performance. It
+    // falls back to the standing five/one/one when there is not enough data,
+    // when Claude is unavailable, or when its answer fails validation.
+    let strategy = ai_strategy(&c);
+    let quota = strategy
+        .as_ref()
+        .map(|s| s.daily_quota.clone())
+        .unwrap_or_else(|| HashMap::from([
+            ("carousel".to_string(), 5u32),
+            ("reel".to_string(), 1),
+            ("story_pack".to_string(), 1),
+        ]));
+    match &strategy {
+        Some(s) => println!("strategy from Claude ({}): {:?} at {:?} — {}", s.confidence, s.daily_quota, s.posting_hours, s.reasoning),
+        None => println!("strategy: measured-evidence fallback (five carousels, one Reel, one Story)"),
+    }
+    if let Some(hours) = strategy.as_ref().map(|s| s.posting_hours.clone()) {
+        // Hand the chosen hours to the scheduler as the learned best times.
+        let _ = c.execute(
+            "INSERT INTO app_settings(key,value)VALUES('ai_posting_hours',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [hours.iter().map(|h| h.to_string()).collect::<Vec<_>>().join(",")],
+        );
+    }
+    let per_day: u32 = quota.values().sum::<u32>().clamp(5, 12);
     let formats = vec![
         "carousel".to_string(),
         "reel".to_string(),
@@ -3305,11 +3452,11 @@ pub fn prepare_week_headless() -> Result<(), String> {
             continue;
         }
         match build_content_campaign(
-            &mut c, &cache, 1, image_ids, 7, 7, wedding_id, formats.clone(),
+            &mut c, &cache, 1, image_ids, per_day as usize, per_day, wedding_id, formats.clone(),
             Some(quota.clone()), Some(produced),
         ) {
             Ok(_) => {
-                produced += 7;
+                produced += per_day as usize;
                 println!("prepared wedding {wedding_id}");
             }
             // One wedding failing must not abandon the rest of the week.
