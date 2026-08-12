@@ -285,6 +285,17 @@ fn migrations(c: &Connection) -> rusqlite::Result<()> {
         // Schema kept byte-identical to `ensure_recovery_schema` in the publisher.
         c.execute_batch("CREATE TABLE IF NOT EXISTS publish_recovery(post_id INTEGER PRIMARY KEY REFERENCES posts(id) ON DELETE CASCADE,failure_class TEXT NOT NULL,retry_count INTEGER NOT NULL DEFAULT 0,next_retry_at TEXT,requires_action INTEGER NOT NULL DEFAULT 0,resolution_hint TEXT DEFAULT '',last_error TEXT DEFAULT '',updated_at TEXT DEFAULT CURRENT_TIMESTAMP); INSERT INTO schema_migrations(version)VALUES(10);")?;
     }
+    let has_v11 = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=11)",
+        [],
+        |r| r.get::<_, bool>(0),
+    )?;
+    if !has_v11 {
+        // Model tiering. Vision writes the captions and is by far the highest
+        // volume, so it gets the strongest mid-tier model; the weekly strategy
+        // call is arithmetic over aggregates and runs on the cheapest.
+        c.execute_batch("INSERT OR IGNORE INTO app_settings(key,value)VALUES('claude_model_vision','sonnet'),('claude_model_strategy','haiku'),('claude_model_diagnosis','sonnet'),('last_vision_provider',''),('last_vision_error',''); INSERT INTO schema_migrations(version)VALUES(11);")?;
+    }
     c.execute(
         "INSERT OR IGNORE INTO app_settings(key,value)VALUES('posting_time_mode','suggest')",
         [],
@@ -911,6 +922,67 @@ fn caption_too_similar(c: &Connection, caption: &str) -> bool {
         })
         .unwrap_or(false)
 }
+/// Swap out hashtags that dominate the recent queue.
+///
+/// The Autopilot screen claims "caption and hashtag repetition" is checked;
+/// only captions ever were. A tag used in more than a third of the last thirty
+/// posts is replaced with an unused regional alternative.
+fn diversify_hashtags(c: &Connection, tags: Vec<String>) -> Vec<String> {
+    let recent = c
+        .prepare("SELECT hashtags_json FROM posts WHERE hashtags_json NOT IN ('','[]') ORDER BY id DESC LIMIT 30")
+        .ok()
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |r| r.get::<_, String>(0))
+                .ok()
+                .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+    if recent.len() < 6 {
+        return tags;
+    }
+    let mut counts = HashMap::<String, usize>::new();
+    for row in &recent {
+        for tag in serde_json::from_str::<Vec<String>>(row).unwrap_or_default() {
+            *counts.entry(tag.to_lowercase()).or_default() += 1;
+        }
+    }
+    let overused = |tag: &str| {
+        counts.get(&tag.to_lowercase()).copied().unwrap_or(0) * 3 > recent.len()
+    };
+    let alternatives = [
+        "#lancashireweddingphotographer",
+        "#lakedistrictweddingphotographer",
+        "#cheshireweddingphotographer",
+        "#northwestweddingphotographer",
+        "#documentaryweddingphotography",
+        "#unposedweddingphotography",
+        "#realweddingmoments",
+        "#weddingreportage",
+    ];
+    let mut used = tags
+        .iter()
+        .map(|tag| tag.to_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+    tags.into_iter()
+        .map(|tag| {
+            if !overused(&tag) {
+                return tag;
+            }
+            match alternatives
+                .iter()
+                .find(|candidate| !used.contains(**candidate) && !overused(candidate))
+            {
+                Some(replacement) => {
+                    used.insert(replacement.to_string());
+                    replacement.to_string()
+                }
+                None => tag,
+            }
+        })
+        .collect()
+}
+
 fn hash_file(p: &Path) -> Result<String, String> {
     let mut f = fs::File::open(p).map_err(|e| e.to_string())?;
     let mut h = Sha256::new();
@@ -1214,7 +1286,7 @@ fn create_campaign(
             .map(|analysis| analysis.hashtags)
             .unwrap_or_else(|| wedding_hashtags(&venue, &category, i));
         add_supplier_context(&tx, wedding_id, &mut caption, i);
-        let tags = serde_json::to_string(&tag_list).unwrap();
+        let tags = serde_json::to_string(&diversify_hashtags(&tx, tag_list)).unwrap();
         tx.execute("INSERT INTO posts(profile_id,caption,hashtags_json,status,scheduled_at,post_type,ai_generated)VALUES(?,?,?,'needs_review',?,'single',1)",params![profile_id,caption,tags,d.to_string()]).map_err(|e|e.to_string())?;
         let post = tx.last_insert_rowid();
         tx.execute(
@@ -1311,6 +1383,7 @@ fn export_story_images(paths: &[String], output: &Path) -> Result<(), String> {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn create_content_campaign(
     profile_id: i64,
     image_ids: Vec<i64>,
@@ -1318,6 +1391,7 @@ fn create_content_campaign(
     posts_per_day: u32,
     wedding_id: i64,
     formats: Vec<String>,
+    per_type_per_day: Option<u32>,
     state: State<AppState>,
 ) -> Result<i64, String> {
     if image_ids.is_empty() || formats.is_empty() {
@@ -1357,12 +1431,21 @@ fn create_content_campaign(
     let mut created_post_ids = Vec::new();
     tx.execute("INSERT INTO campaigns(profile_id,collection_id,name,start_date,requested_post_count,posts_per_week,status)VALUES(?,?,?, ?,?,35,'proposed')", params![profile_id,collection_id,format!("{} Content Studio",couple),start.to_string(),count]).map_err(|e|e.to_string())?;
     let campaign_id = tx.last_insert_rowid();
+    // Strongest measured format first, then fill the daily quota of each type.
+    let ranked = formats_by_evidence(&tx, &formats);
+    let quota = per_type_per_day.unwrap_or(0);
+    let plan = format_plan(&ranked, count, quota);
+    let daily_total = if quota > 0 {
+        (quota as usize * ranked.len().max(1)) as u32
+    } else {
+        posts_per_day
+    };
     let mut cursor = 0usize;
     for index in 0..count {
         if cursor >= ids.len() {
             break;
         }
-        let format = formats[index % formats.len()].as_str();
+        let format = plan[index].as_str();
         let wanted = match format {
             "carousel" => 7,
             "reel" => 12,
@@ -1390,14 +1473,18 @@ fn create_content_campaign(
             .map(|analysis| analysis.hashtags)
             .unwrap_or_else(|| wedding_hashtags(&venue, &category, index));
         add_supplier_context(&tx, Some(wedding_id), &mut caption, index);
-        let tags = serde_json::to_string(&tag_list).unwrap();
+        let tags = serde_json::to_string(&diversify_hashtags(&tx, tag_list)).unwrap();
         let learned_hours = learned_posting_hours(&tx, posts_per_day.clamp(1, 5) as usize);
+        let minutes = daily_slot_minutes(daily_total.max(1) as usize, &learned_hours);
         // Only queue what the publisher can actually ship. Formats it cannot
         // publish are still rendered and kept as drafts to use by hand, but they
         // never take a slot and never fail on their scheduled day.
         let can_publish = publishable("instagram", format);
-        let scheduled = can_publish
-            .then(|| next_daily_slot_with_hours(start, index, &learned_hours).to_string());
+        let scheduled = can_publish.then(|| {
+            let per_day = minutes.len().max(1);
+            let day = start + Duration::days((index / per_day) as i64);
+            slot_at(day, minutes[index % per_day]).to_string()
+        });
         let status = if can_publish { "needs_review" } else { "draft" };
         tx.execute("INSERT INTO posts(profile_id,caption,hashtags_json,status,scheduled_at,post_type,ai_generated)VALUES(?,?,?,?,?,?,1)",params![profile_id,caption,tags,status,scheduled,format]).map_err(|e|e.to_string())?;
         let post_id = tx.last_insert_rowid();
@@ -1473,7 +1560,7 @@ fn create_content_campaign(
     }
     // Reflow last, so the slots go to the posts that can actually use them —
     // including the TikTok copies, whose Instagram parents are now drafts.
-    reflow_wedding_rotation(&tx, start, posts_per_day.clamp(1, 5))?;
+    reflow_wedding_rotation(&tx, start, daily_total.clamp(1, 30))?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(campaign_id)
 }
@@ -1518,7 +1605,8 @@ fn rotation_plan_with_hours(
     posts_per_day: u32,
     hours: &[u32],
 ) -> Vec<Vec<chrono::DateTime<Local>>> {
-    let daily = posts_per_day.clamp(1, 5) as usize;
+    let daily = posts_per_day.clamp(1, 30) as usize;
+    let minutes = daily_slot_minutes(daily, hours);
     let mut result = counts.iter().map(|_| Vec::new()).collect::<Vec<_>>();
     let mut remaining = counts.to_vec();
     let mut day_offset = 0_i64;
@@ -1529,13 +1617,8 @@ fn rotation_plan_with_hours(
             }
             let batch = remaining[wedding].min(daily);
             let day = start + Duration::days(day_offset);
-            for hour in hours.iter().take(batch) {
-                result[wedding].push(
-                    Local
-                        .from_local_datetime(&day.and_hms_opt(*hour, 0, 0).unwrap())
-                        .single()
-                        .unwrap(),
-                );
+            for slot in minutes.iter().take(batch) {
+                result[wedding].push(slot_at(day, *slot));
             }
             remaining[wedding] -= batch;
             day_offset += 1;
@@ -1585,6 +1668,31 @@ fn reflow_wedding_rotation(
     }
     Ok(())
 }
+/// Minutes-past-midnight for `count` posts in a day.
+///
+/// Up to five posts use the learned or curated hours. Beyond that there are
+/// more posts than good hours, so they are spread evenly across 08:00-21:00 —
+/// hour granularity would stack several posts on the same minute.
+fn daily_slot_minutes(count: usize, learned: &[u32]) -> Vec<u32> {
+    if count <= learned.len() && !learned.is_empty() {
+        return learned.iter().take(count).map(|hour| hour * 60).collect();
+    }
+    if count <= 1 {
+        return vec![19 * 60];
+    }
+    let (start, end) = (8 * 60u32, 21 * 60u32);
+    (0..count)
+        .map(|index| start + ((end - start) as usize * index / (count - 1)) as u32)
+        .collect()
+}
+
+fn slot_at(day: NaiveDate, minutes: u32) -> chrono::DateTime<Local> {
+    Local
+        .from_local_datetime(&day.and_hms_opt(minutes / 60, minutes % 60, 0).unwrap())
+        .single()
+        .unwrap()
+}
+
 fn next_daily_slot(start: NaiveDate, index: usize, posts_per_day: u32) -> chrono::DateTime<Local> {
     let count = posts_per_day.clamp(1, 5) as usize;
     next_daily_slot_with_hours(start, index, &default_posting_hours(count))
@@ -1601,6 +1709,66 @@ fn next_daily_slot_with_hours(
         .single()
         .unwrap()
 }
+/// Order the requested formats by measured engagement, strongest first.
+///
+/// The brain already computes that carousels outperform singles; generation
+/// used `formats[index % formats.len()]`, a flat rotation that ignored it.
+fn formats_by_evidence(c: &Connection, requested: &[String]) -> Vec<String> {
+    let report = build_analytics_report(c, &HashMap::new());
+    let mut scored = requested
+        .iter()
+        .map(|format| {
+            let measured = report
+                .formats
+                .iter()
+                .find(|item| &item.format == format && item.posts >= 2)
+                .map(|item| item.average_score);
+            // Unmeasured formats sort mid-table so they still get a fair trial.
+            (format.clone(), measured.unwrap_or(f64::NEG_INFINITY), measured.is_some())
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    scored.into_iter().map(|(format, _, _)| format).collect()
+}
+
+/// One format per post, filling `per_type_per_day` of every format each day.
+///
+/// Within a day the strongest format takes the earliest (best-evidence) slot.
+fn format_plan(ranked: &[String], count: usize, per_type_per_day: u32) -> Vec<String> {
+    if ranked.is_empty() {
+        return Vec::new();
+    }
+    let mut plan = Vec::with_capacity(count);
+    if per_type_per_day == 0 {
+        // No quota: weight the rotation towards the stronger formats by giving
+        // the leader one extra turn per cycle.
+        while plan.len() < count {
+            for (position, format) in ranked.iter().enumerate() {
+                let turns = if position == 0 { 2 } else { 1 };
+                for _ in 0..turns {
+                    if plan.len() < count {
+                        plan.push(format.clone());
+                    }
+                }
+            }
+        }
+        return plan;
+    }
+    while plan.len() < count {
+        for format in ranked {
+            for _ in 0..per_type_per_day {
+                if plan.len() < count {
+                    plan.push(format.clone());
+                }
+            }
+        }
+    }
+    plan
+}
+
 fn brand_caption(couple: &str, venue: &str, category: &str, index: usize) -> String {
     let lines=[format!("Nobody planned this bit. Which is precisely why it mattered.\n\n{} at {} — the day carrying on while everyone forgot about the camera.",couple,venue),format!("The official description: {}.\n\nThe accurate description: a room full of people thoroughly enjoying themselves while I kept out of the way.",category),format!("This lasted about three seconds. Long enough.\n\n{} at {}, exactly as it happened.",couple,venue),"One of the bits they didn't see until the gallery arrived.\n\nNo direction. No repeat. Just paying attention.".to_string(),format!("A strong argument for letting weddings be weddings.\n\n{} — unscripted, unpolished and considerably better for it.",category)];
     lines[index % lines.len()].clone()
@@ -1975,11 +2143,13 @@ fn run_with_timeout(
 
 fn run_claude_vision(
     executable: &str,
+    model: &str,
     items: &[(i64, String)],
     couple: &str,
     venue: &str,
 ) -> Result<Vec<VisualAnalysis>, String> {
     let mut command = Command::new(executable);
+    command.arg("--model").arg(model);
     command.args([
         "--print",
         "--output-format",
@@ -2085,29 +2255,56 @@ async fn analyse_images_ai(
         let previews = image_ids.iter().filter_map(|id| c.query_row("SELECT thumbnail_path FROM images WHERE id=? AND thumbnail_path IS NOT NULL AND NOT EXISTS(SELECT 1 FROM image_analysis WHERE image_id=? AND provider IN ('claude','openai'))", params![id,id], |r| r.get::<_, String>(0)).ok().map(|path| (*id, path))).collect::<Vec<_>>();
         (wedding.0, wedding.1, previews)
     };
+    let vision_model = {
+        let c = state.db.lock().unwrap();
+        c.query_row(
+            "SELECT value FROM app_settings WHERE key='claude_model_vision'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| "sonnet".into())
+    };
     let mut run = AnalysisRun {
         analysed: 0,
         claude_batches: 0,
         openai_batches: 0,
     };
+    let mut first_claude_error: Option<String> = None;
     for batch in previews.chunks(5) {
         let items = batch.to_vec();
-        let (provider, model, results) = if let Some(results) = claude
+        // Try Claude, but keep the reason it failed. Discarding it with .ok()
+        // meant every batch silently fell through to Codex with no way to find
+        // out why — 5,579 images were analysed by the fallback unnoticed.
+        let claude_attempt = claude
             .as_deref()
-            .and_then(|path| run_claude_vision(path, &items, &couple, &venue).ok())
-        {
-            run.claude_batches += 1;
-            ("claude", "subscription-vision", results)
-        } else {
-            let path = codex.as_deref().ok_or_else(|| {
-                "Claude reached its limit and Codex is not installed or signed in".to_string()
-            })?;
-            let results =
-                run_codex_vision(path, &state.cache, &items, &couple, &venue).map_err(|e| {
-                    format!("Claude was unavailable and the ChatGPT fallback failed: {e}")
+            .map(|path| run_claude_vision(path, &vision_model, &items, &couple, &venue));
+        let (provider, model, results) = match claude_attempt {
+            Some(Ok(results)) => {
+                run.claude_batches += 1;
+                ("claude", vision_model.as_str(), results)
+            }
+            other => {
+                if let Some(Err(error)) = other {
+                    if first_claude_error.is_none() {
+                        first_claude_error = Some(error);
+                    }
+                }
+                let path = codex.as_deref().ok_or_else(|| {
+                    format!(
+                        "Claude could not analyse these photographs and Codex is not installed: {}",
+                        first_claude_error.clone().unwrap_or_else(|| "unknown reason".into())
+                    )
                 })?;
-            run.openai_batches += 1;
-            ("openai", "gpt-5.6-sol", results)
+                let results =
+                    run_codex_vision(path, &state.cache, &items, &couple, &venue).map_err(|e| {
+                        format!(
+                            "Claude was unavailable ({}) and the ChatGPT fallback also failed: {e}",
+                            first_claude_error.clone().unwrap_or_else(|| "no error reported".into())
+                        )
+                    })?;
+                run.openai_batches += 1;
+                ("openai", "gpt-5.6-sol", results)
+            }
         };
         let c = state.db.lock().unwrap();
         for mut result in results {
@@ -2148,6 +2345,18 @@ async fn analyse_images_ai(
             .map_err(|e| e.to_string())?;
             run.analysed += 1;
         }
+    }
+    {
+        let c = state.db.lock().unwrap();
+        let used = if run.claude_batches > 0 && run.openai_batches == 0 {
+            format!("claude ({vision_model})")
+        } else if run.claude_batches == 0 && run.openai_batches > 0 {
+            "openai (gpt-5.6-sol)".to_string()
+        } else {
+            format!("mixed: {} claude, {} openai", run.claude_batches, run.openai_batches)
+        };
+        let _ = c.execute("INSERT INTO app_settings(key,value)VALUES('last_vision_provider',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [used]);
+        let _ = c.execute("INSERT INTO app_settings(key,value)VALUES('last_vision_error',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [first_claude_error.clone().unwrap_or_default()]);
     }
     Ok(run)
 }
@@ -2927,6 +3136,54 @@ mod tests {
         let single: String = c.query_row("SELECT status FROM posts WHERE id=2",[],|r|r.get(0)).unwrap();
         assert_eq!(unsupported, "needs_review");
         assert_eq!(single, "scheduled");
+    }
+
+    #[test]
+    fn format_plan_fills_a_daily_quota_of_each_type() {
+        let ranked = vec!["carousel".to_string(), "reel".to_string(), "story_pack".to_string()];
+        let plan = format_plan(&ranked, 105, 5);
+        assert_eq!(plan.len(), 105);
+        for format in &ranked {
+            assert_eq!(plan.iter().filter(|item| *item == format).count(), 35,
+                "{format}: five a day across seven days");
+        }
+        // First day: five of each, strongest format first.
+        assert_eq!(&plan[0..5], &["carousel"; 5][..]);
+    }
+
+    #[test]
+    fn strongest_measured_format_leads_the_plan() {
+        let c = Connection::open_in_memory().unwrap();
+        migrations(&c).unwrap();
+        for index in 0..3 {
+            c.execute("INSERT INTO instagram_performance(instagram_media_id,post_type,reach,likes,comments,saves,shares,plays,published_at,section)VALUES(?,'carousel',1000,60,8,14,6,0,'2026-08-01T19:00:00+00:00','confetti')",[format!("c{index}")]).unwrap();
+            c.execute("INSERT INTO instagram_performance(instagram_media_id,post_type,reach,likes,comments,saves,shares,plays,published_at,section)VALUES(?,'single',1000,10,1,0,0,0,'2026-08-01T09:00:00+00:00','details')",[format!("s{index}")]).unwrap();
+        }
+        let ranked = formats_by_evidence(&c, &["single".to_string(), "carousel".to_string()]);
+        assert_eq!(ranked[0], "carousel", "measured winner must lead, not list order");
+    }
+
+    #[test]
+    fn fifteen_posts_a_day_get_distinct_times() {
+        let minutes = daily_slot_minutes(15, &[]);
+        assert_eq!(minutes.len(), 15);
+        let unique = minutes.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), 15, "no two posts may share a minute");
+        assert!(minutes[0] >= 8 * 60 && *minutes.last().unwrap() <= 21 * 60);
+    }
+
+    #[test]
+    fn overused_hashtags_are_swapped_out() {
+        let c = Connection::open_in_memory().unwrap();
+        migrations(&c).unwrap();
+        for index in 0..12 {
+            c.execute("INSERT INTO posts(profile_id,status,hashtags_json)VALUES(1,'draft','[\"#weddingstorytelling\",\"#other\"]')",[]).unwrap();
+            let _ = index;
+        }
+        let out = diversify_hashtags(&c, vec!["#weddingstorytelling".into(), "#fresh".into()]);
+        assert!(!out.contains(&"#weddingstorytelling".to_string()), "saturated tag must be replaced");
+        assert!(out.contains(&"#fresh".to_string()), "unsaturated tag must survive");
+        assert_eq!(out.len(), 2);
     }
 
     #[test]

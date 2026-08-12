@@ -83,6 +83,10 @@ export default function App() {
       Record<number, "queued" | "running">
     >({});
   const analysisQueue = useRef(Promise.resolve());
+  // Autopilot re-enters whenever data refreshes, and the "already prepared"
+  // marker is only written at the end of a long run. Without this guard a
+  // refresh mid-run starts a second preparation and duplicates the week.
+  const autopilotRunning = useRef(false);
   const refresh = useCallback(async () => {
     try {
       setData(await command<AppData>("load_data"));
@@ -133,14 +137,17 @@ export default function App() {
   useEffect(() => {
     if (data.settings.autopilot_enabled !== "true" || new Date().getDay() !== 0) return;
     const week = new Date().toISOString().slice(0, 10);
-    if (data.settings.autopilot_last_prepared === week) return;
+    if (data.settings.autopilot_last_prepared === week || autopilotRunning.current) return;
     const eligible = data.weddings.filter((w) =>
       w.collection_id && !["none", "portfolio_only"].includes(w.consent_level) &&
       (!w.embargo_until || new Date(w.embargo_until) <= new Date()));
     if (!eligible.length) return;
+    autopilotRunning.current = true;
     (async () => {
+      // Claim the week before the long run, not after it.
+      await command("set_setting", { key: "autopilot_last_prepared", value: week });
       await command("index_visual_duplicates");
-      let remaining = 35;
+      let remaining = 105;
       for (let index = 0; index < eligible.length && remaining > 0; index++) {
         const wedding = eligible[index];
         const imageIds = data.images.filter((image) =>
@@ -150,10 +157,11 @@ export default function App() {
         await command("create_content_campaign", { profileId: 1, imageIds, count, postsPerDay: 5, weddingId: wedding.id, formats: ["carousel", "reel", "single", "story_pack"] });
         remaining -= count;
       }
-      await command("set_setting", { key: "autopilot_last_prepared", value: week });
       await refresh();
       setToast("Sunday campaign prepared and waiting for review");
-    })().catch((reason) => setError(String(reason)));
+    })()
+      .catch((reason) => setError(String(reason)))
+      .finally(() => { autopilotRunning.current = false; });
   }, [data.images, data.settings, data.weddings, refresh]);
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
@@ -970,7 +978,8 @@ function Autopilot({ data, run, setView }: any) {
       async () => {
         if (!eligible.length) throw Error("No marketing-approved weddings are ready");
         await command("index_visual_duplicates");
-        let remaining = 35;
+        // Three formats x five a day x seven days.
+        let remaining = 105;
         for (let index = 0; index < eligible.length && remaining > 0; index++) {
           const wedding = eligible[index];
           const weddingsLeft = eligible.length - index;
@@ -987,9 +996,10 @@ function Autopilot({ data, run, setView }: any) {
             profileId: 1,
             imageIds,
             count,
-            postsPerDay: 5,
+            postsPerDay: 15,
             weddingId: wedding.id,
-            formats: ["carousel", "reel", "single", "story_pack"],
+            formats: ["carousel", "reel", "story_pack"],
+            perTypePerDay: 5,
           });
           remaining -= count;
         }
@@ -1007,7 +1017,7 @@ function Autopilot({ data, run, setView }: any) {
     <section className="content autopilot">
       <div className="autopilot-hero">
         <span className="eyebrow">MARKETING AUTOPILOT</span>
-        <h2>Five thoughtful posts a day. One short approval session.</h2>
+        <h2>Five carousels, five Reels and five Stories a day. One approval session.</h2>
         <p>SocialFlow chooses the photographs, story mix, formats, captions, hashtags and recommended times. Nothing publishes until you approve it.</p>
         <button className="primary" onClick={buildWeek} disabled={!eligible.length || ready === 0}>
           <Sparkles size={16}/> Prepare the next seven days
@@ -1030,7 +1040,7 @@ function Autopilot({ data, run, setView }: any) {
         <div>
           <span>✓ Consent and embargo safety</span><span>✓ Near-duplicate and repeat-use control</span>
           <span>✓ Balanced wedding-day storytelling</span><span>✓ Caption and hashtag repetition</span>
-          <span>✓ Best format and posting-time evidence</span><span>✓ Venue, season and supplier context</span>
+          <span>✓ Best format and posting-time evidence</span><span>✓ Venue and supplier context</span>
           <span>✓ Content-fatigue warnings</span><span>✓ Failed-post recovery queue</span>
         </div>
       </div>
@@ -1042,7 +1052,7 @@ function Autopilot({ data, run, setView }: any) {
         <div className="permission-banner"><AlertTriangle size={16}/><span><b>Instagram connection needs attention soon</b><small>The access token expires {formatDate(data.marketing.token_expiry)}. Replace it in Settings before publishing is interrupted.</small></span></div>
       )}
       <div className="autopilot-health">
-        <span><b>Sunday campaign preparation</b><small>{enabled ? "On — prepares 35 posts every Sunday for your approval" : "Off — use Prepare the next seven days manually"}</small></span>
+        <span><b>Sunday campaign preparation</b><small>{enabled ? "On — prepares the next seven days every Sunday, if SocialFlow is open" : "Off — use Prepare the next seven days manually"}</small></span>
         <button onClick={() => run(enabled ? "Pausing Sunday preparation…" : "Enabling Sunday preparation…", () => command("set_setting", { key: "autopilot_enabled", value: enabled ? "false" : "true" }), enabled ? "Sunday preparation is off" : "Sunday preparation is on")}>{enabled ? "Turn off" : "Turn on"}</button>
       </div>
       <div className="autopilot-health">
