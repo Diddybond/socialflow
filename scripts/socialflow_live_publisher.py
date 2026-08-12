@@ -544,7 +544,7 @@ def publish_instagram(post_id: int) -> None:
     db = sqlite3.connect(DB)
     db.row_factory = sqlite3.Row
     row = db.execute(
-        """SELECT p.id,p.caption,p.hashtags_json,p.post_type,i.id image_id,i.source_path,
+        """SELECT p.id,p.caption,p.hashtags_json,p.post_type,p.asset_path,i.id image_id,i.source_path,
                   ia.instagram_user_id
            FROM posts p JOIN post_images pi ON pi.post_id=p.id AND pi.position=0
            JOIN images i ON i.id=pi.image_id
