@@ -20,6 +20,10 @@ use walkdir::WalkDir;
 struct AppState {
     db: Mutex<Connection>,
     cache: PathBuf,
+    /// Installed copy of the Python workers. Kept outside the source tree so a
+    /// launchd agent can read it (macOS denies background agents ~/Documents)
+    /// and so the running publisher cannot change when a git branch changes.
+    scripts: PathBuf,
 }
 #[derive(Serialize)]
 struct ImportResult {
@@ -698,7 +702,7 @@ fn learned_posting_hours(c: &Connection, count: usize) -> Vec<u32> {
 /// Both columns are COALESCEd so the predicate is total: with a NULL
 /// `post_type` SQLite would otherwise yield NULL, and `NOT NULL` is NULL, so a
 /// row could be neither publishable nor stood down.
-const PUBLISHABLE_SQL: &str = "((COALESCE(platform,'instagram')='instagram' AND COALESCE(post_type,'single')='single') OR COALESCE(platform,'instagram')='facebook' OR (COALESCE(platform,'instagram')='tiktok' AND COALESCE(post_type,'single')='reel'))";
+const PUBLISHABLE_SQL: &str = "((COALESCE(platform,'instagram')='instagram' AND COALESCE(post_type,'single') IN ('single','carousel','reel','story_pack')) OR COALESCE(platform,'instagram')='facebook' OR (COALESCE(platform,'instagram')='tiktok' AND COALESCE(post_type,'single')='reel'))";
 
 /// Whether SocialFlow can actually publish this combination today.
 ///
@@ -709,8 +713,9 @@ const PUBLISHABLE_SQL: &str = "((COALESCE(platform,'instagram')='instagram' AND 
 /// scheduled day after burning eight retries.
 fn publishable(platform: &str, post_type: &str) -> bool {
     match platform {
-        // Instagram's container API is only implemented for one photograph.
-        "instagram" => post_type == "single",
+        // Instagram's container API: single photo, carousel children, REELS
+        // video, and STORIES. A story_pack publishes its first frame as a Story.
+        "instagram" => matches!(post_type, "single" | "carousel" | "reel" | "story_pack"),
         // Facebook's /photos endpoint accepts anything: the publisher sends the
         // first photograph of the post whatever its type. Live history confirms
         // carousels, Reels and singles have all published to the Page. It is
@@ -1736,7 +1741,7 @@ fn start_live_publisher(state: State<AppState>) -> Result<(), String> {
             .map_err(|_| "Instagram token is unavailable. Reconnect Instagram in Settings.".to_string())
     }).transpose()?;
     let mut publisher = Command::new("/usr/bin/python3");
-    publisher.arg("/Users/wayne/Documents/waynes buffer/scripts/socialflow_live_publisher.py").arg("--due");
+    publisher.arg(state.scripts.join("socialflow_live_publisher.py")).arg("--due");
     if let Some(token) = token { publisher.env("SOCIALFLOW_IG_TOKEN", token); }
     publisher.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
         .map_err(|error| format!("Could not start automatic publishing: {error}"))?;
@@ -2602,7 +2607,7 @@ fn save_tiktok_connection(
 fn connect_tiktok_oauth(client_key: String, client_secret: String, state: State<AppState>) -> Result<TikTokConnectionResult, String> {
     if client_key.trim().is_empty() || client_secret.trim().is_empty() { return Err("TikTok Client Key and Client Secret are required".into()); }
     let output=Command::new("/usr/bin/python3")
-        .arg("/Users/wayne/Documents/waynes buffer/scripts/socialflow_tiktok_oauth.py")
+        .arg(state.scripts.join("socialflow_tiktok_oauth.py"))
         .env("SOCIALFLOW_TIKTOK_CLIENT_KEY",client_key.trim()).env("SOCIALFLOW_TIKTOK_CLIENT_SECRET",client_secret.trim())
         .output().map_err(|e|format!("Could not start TikTok login: {e}"))?;
     if !output.status.success() { return Err(format!("TikTok login failed: {}",String::from_utf8_lossy(&output.stderr).trim())); }
@@ -2722,9 +2727,23 @@ pub fn run() {
                 "INSERT OR IGNORE INTO app_settings(key,value)VALUES('timezone',?)",
                 [chrono::Local::now().format("%Z").to_string()],
             )?;
+            let scripts = data.join("scripts");
+            fs::create_dir_all(&scripts)?;
+            // Refresh the installed workers from the bundle on every launch, so
+            // updating the app updates the publisher the launchd agent runs.
+            if let Ok(bundled) = app.path().resolve("scripts", tauri::path::BaseDirectory::Resource) {
+                if let Ok(entries) = fs::read_dir(&bundled) {
+                    for entry in entries.flatten() {
+                        if entry.path().extension().and_then(|x| x.to_str()) == Some("py") {
+                            let _ = fs::copy(entry.path(), scripts.join(entry.file_name()));
+                        }
+                    }
+                }
+            }
             app.manage(AppState {
                 db: Mutex::new(c),
                 cache,
+                scripts,
             });
             Ok(())
         })
@@ -2881,12 +2900,13 @@ mod tests {
     #[test]
     fn only_shippable_formats_are_publishable() {
         // B1: the combinations the publisher actually implements.
-        assert!(publishable("instagram", "single"));
         assert!(publishable("tiktok", "reel"));
-        for format in ["carousel", "reel", "story_pack"] {
-            assert!(!publishable("instagram", format), "{format} cannot be sent to Instagram");
-        }
         assert!(!publishable("tiktok", "single"));
+        // Instagram now has the full container flow: photo, carousel, Reel, Story.
+        for format in ["single", "carousel", "reel", "story_pack"] {
+            assert!(publishable("instagram", format), "Instagram publishes {format}");
+        }
+        assert!(!publishable("instagram", "livestream"));
         // Live history: Facebook has published carousels, Reels and singles.
         // Blocking any of them would be a regression, however lossy the result.
         for format in ["single", "carousel", "reel", "story_pack"] {
@@ -2900,12 +2920,12 @@ mod tests {
         // certain to fail on its scheduled day.
         let c = Connection::open_in_memory().unwrap();
         migrations(&c).unwrap();
-        c.execute("INSERT INTO posts(id,profile_id,status,post_type,platform,scheduled_at)VALUES(1,1,'needs_review','carousel','instagram','2026-08-12 09:00:00')",[]).unwrap();
+        c.execute("INSERT INTO posts(id,profile_id,status,post_type,platform,scheduled_at)VALUES(1,1,'needs_review','livestream','instagram','2026-08-12 09:00:00')",[]).unwrap();
         c.execute("INSERT INTO posts(id,profile_id,status,post_type,platform,scheduled_at)VALUES(2,1,'needs_review','single','instagram','2026-08-12 09:00:00')",[]).unwrap();
         c.execute(&format!("UPDATE posts SET status=CASE WHEN scheduled_at IS NULL THEN 'approved' ELSE 'scheduled' END WHERE status IN ('draft','needs_review','approved') AND {PUBLISHABLE_SQL}"),[]).unwrap();
-        let carousel: String = c.query_row("SELECT status FROM posts WHERE id=1",[],|r|r.get(0)).unwrap();
+        let unsupported: String = c.query_row("SELECT status FROM posts WHERE id=1",[],|r|r.get(0)).unwrap();
         let single: String = c.query_row("SELECT status FROM posts WHERE id=2",[],|r|r.get(0)).unwrap();
-        assert_eq!(carousel, "needs_review");
+        assert_eq!(unsupported, "needs_review");
         assert_eq!(single, "scheduled");
     }
 

@@ -196,17 +196,26 @@ def refresh_tiktok_token() -> None:
 
 
 class OneImage(http.server.BaseHTTPRequestHandler):
-    path_token = ""
-    image_path = Path()
+    """Serves the files of a single post over the temporary tunnel.
+
+    A carousel needs every one of its photographs reachable at the same time,
+    and a Reel needs its rendered video, so this holds a token->path map rather
+    than one file. Tokens are random per publish and the server dies with it.
+    """
+
+    files: dict[str, Path] = {}
 
     def do_GET(self) -> None:
-        if self.path.split("?", 1)[0] != f"/{self.path_token}":
+        token = self.path.split("?", 1)[0].lstrip("/")
+        target = self.files.get(token)
+        if target is None:
             self.send_error(404)
             return
-        content = self.image_path.read_bytes()
+        content = target.read_bytes()
         self.send_response(200)
-        self.send_header("Content-Type", mimetypes.guess_type(self.image_path.name)[0] or "image/jpeg")
+        self.send_header("Content-Type", mimetypes.guess_type(target.name)[0] or "image/jpeg")
         self.send_header("Content-Length", str(len(content)))
+        self.send_header("Accept-Ranges", "none")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(content)
@@ -215,9 +224,23 @@ class OneImage(http.server.BaseHTTPRequestHandler):
         return
 
 
+def temporary_urls(paths: list[Path]):
+    """Expose several local files on one quick tunnel. Returns (urls, server, tunnel)."""
+    OneImage.files = {
+        secrets.token_urlsafe(24) + path.suffix.lower(): path for path in paths
+    }
+    tokens = list(OneImage.files)
+    urls, server, tunnel = _tunnel_for(tokens)
+    return urls, server, tunnel
+
+
 def temporary_url(image_path: Path):
-    OneImage.path_token = secrets.token_urlsafe(32) + image_path.suffix.lower()
-    OneImage.image_path = image_path
+    """Single-file form, kept so the existing photo path reads unchanged."""
+    urls, server, tunnel = temporary_urls([image_path])
+    return urls[0], server, tunnel
+
+
+def _tunnel_for(tokens: list[str]):
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), OneImage)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     last_error = ""
@@ -241,18 +264,20 @@ def temporary_url(image_path: Path):
             if tunnel.poll() is not None:
                 break
         if public:
-            media_url = f"{public}/{OneImage.path_token}"
+            urls = [f"{public}/{token}" for token in tokens]
             readiness_deadline = time.time() + 35
             while time.time() < readiness_deadline:
+                # Probe the first file only: once one edge serves this tunnel the
+                # rest are reachable, and probing a large video wastes the window.
                 check = subprocess.run(
                     ["/usr/bin/curl", "--silent", "--show-error", "--fail", "--location",
-                     "--max-time", "12", "--output", "/dev/null", "--write-out", "%{http_code} %{content_type}", media_url],
+                     "--max-time", "12", "--output", "/dev/null", "--write-out", "%{http_code} %{content_type}", urls[0]],
                     capture_output=True,
                     text=True,
                 )
                 status = check.stdout.strip()
-                if check.returncode == 0 and status.startswith("200 image/"):
-                    return media_url, server, tunnel
+                if check.returncode == 0 and (status.startswith("200 image/") or status.startswith("200 video/")):
+                    return urls, server, tunnel
                 last_error = check.stderr.strip() or status or "public edge not ready"
                 time.sleep(2)
         else:
@@ -266,9 +291,83 @@ def temporary_url(image_path: Path):
     raise RuntimeError(f"Temporary secure media link was not ready after automatic tunnel replacement: {last_error}")
 
 
-def instagram_ready_copy(source: Path, folder: Path) -> Path:
+def await_container(container: str, token: str, limit: int) -> None:
+    """Block until Meta has finished copying the media, or explain why it failed."""
+    deadline = time.time() + limit
+    while time.time() < deadline:
+        status = api(
+            f"https://graph.instagram.com/{container}?fields=status_code,status&access_token={urllib.parse.quote(token)}",
+            token,
+        )
+        if status.get("status_code") == "FINISHED":
+            return
+        if status.get("status_code") in {"ERROR", "EXPIRED"}:
+            raise RuntimeError(status.get("status") or status["status_code"])
+        time.sleep(4)
+    raise RuntimeError("Instagram did not finish copying the media in time")
+
+
+def publish_instagram_carousel(account: str, token: str, urls: list[str], caption: str) -> str:
+    """Instagram's real carousel flow: an item container per photograph, then a
+    parent container listing them, then one publish."""
+    children = []
+    for url in urls[:10]:  # Instagram accepts a maximum of ten items.
+        item = api(
+            f"https://graph.instagram.com/{account}/media",
+            token,
+            {"image_url": url, "is_carousel_item": "true"},
+        )["id"]
+        children.append(item)
+    if len(children) < 2:
+        raise RuntimeError("A carousel needs at least two photographs")
+    for child in children:
+        await_container(child, token, 120)
+    container = api(
+        f"https://graph.instagram.com/{account}/media",
+        token,
+        {"media_type": "CAROUSEL", "children": ",".join(children), "caption": caption},
+    )["id"]
+    await_container(container, token, 180)
+    return api(
+        f"https://graph.instagram.com/{account}/media_publish",
+        token,
+        {"creation_id": container},
+    )["id"]
+
+
+def publish_instagram_reel(account: str, token: str, video_url: str, caption: str) -> str:
+    container = api(
+        f"https://graph.instagram.com/{account}/media",
+        token,
+        {"media_type": "REELS", "video_url": video_url, "caption": caption},
+    )["id"]
+    # Video transcoding is far slower than a photograph copy.
+    await_container(container, token, 600)
+    return api(
+        f"https://graph.instagram.com/{account}/media_publish",
+        token,
+        {"creation_id": container},
+    )["id"]
+
+
+def publish_instagram_story(account: str, token: str, image_url: str) -> str:
+    # Stories carry no caption; Instagram rejects the field outright.
+    container = api(
+        f"https://graph.instagram.com/{account}/media",
+        token,
+        {"media_type": "STORIES", "image_url": image_url},
+    )["id"]
+    await_container(container, token, 180)
+    return api(
+        f"https://graph.instagram.com/{account}/media_publish",
+        token,
+        {"creation_id": container},
+    )["id"]
+
+
+def instagram_ready_copy(source: Path, folder: Path, name: str = "socialflow-instagram.jpg") -> Path:
     """Create a standard-size sRGB JPEG without altering the photographer's file."""
-    output = folder / "socialflow-instagram.jpg"
+    output = folder / name
     result = subprocess.run(
         [
             "/usr/bin/sips",
@@ -325,11 +424,28 @@ def publish_instagram(post_id: int) -> None:
     ).fetchone()
     if not row:
         raise RuntimeError("Post or connected Instagram account was not found")
-    if row["post_type"] != "single":
-        raise RuntimeError("Today's safe publisher currently accepts single photographs only")
-    original = Path(row["source_path"])
-    if not original.is_file():
-        raise RuntimeError(f"Original photograph is unavailable: {original.name}")
+    post_type = row["post_type"]
+    if post_type not in {"single", "carousel", "story_pack", "reel"}:
+        raise RuntimeError(f"SocialFlow does not publish {post_type} to Instagram")
+    # Every photograph of the post, in the order the photographer arranged them.
+    sources = [
+        Path(item["source_path"])
+        for item in db.execute(
+            """SELECT i.source_path FROM post_images pi JOIN images i ON i.id=pi.image_id
+               WHERE pi.post_id=? ORDER BY pi.position""",
+            (post_id,),
+        ).fetchall()
+    ]
+    missing = [path.name for path in sources if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"Original photograph is unavailable: {', '.join(missing[:3])}")
+    if post_type == "reel":
+        rendered = Path(row["asset_path"] or "")
+        if not rendered.is_file():
+            raise RuntimeError(f"Original photograph is unavailable: the rendered Reel {rendered.name or 'video'} is missing")
+    if post_type == "carousel" and len(sources) < 2:
+        raise RuntimeError("A carousel needs at least two photographs")
+    original = sources[0]
     token = os.environ.get("SOCIALFLOW_IG_TOKEN", "").strip()
     if not token:
         token = subprocess.check_output(
@@ -345,34 +461,42 @@ def publish_instagram(post_id: int) -> None:
     server = tunnel = None
     temporary = tempfile.TemporaryDirectory(prefix="socialflow-instagram-")
     try:
-        image = instagram_ready_copy(original, Path(temporary.name))
-        try:
-            image_url, server, tunnel = temporary_url(image)
-        except Exception:
-            image_url = facebook_cdn_url_for_image(db, row["image_id"])
-        container = api(
-            f"https://graph.instagram.com/{row['instagram_user_id']}/media",
-            token,
-            {"image_url": image_url, "caption": caption},
-        )["id"]
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            status = api(
-                f"https://graph.instagram.com/{container}?fields=status_code,status&access_token={urllib.parse.quote(token)}",
-                token,
-            )
-            if status.get("status_code") == "FINISHED":
-                break
-            if status.get("status_code") in {"ERROR", "EXPIRED"}:
-                raise RuntimeError(status.get("status") or status["status_code"])
-            time.sleep(4)
+        account = row["instagram_user_id"]
+        if post_type == "reel":
+            # The rendered vertical video is served as-is; Meta transcodes it.
+            urls, server, tunnel = temporary_urls([Path(row["asset_path"])])
+            media_id = publish_instagram_reel(account, token, urls[0], caption)
+        elif post_type == "carousel":
+            folder = Path(temporary.name)
+            copies = [
+                instagram_ready_copy(source, folder, f"carousel-{index:02d}.jpg")
+                for index, source in enumerate(sources[:10])
+            ]
+            urls, server, tunnel = temporary_urls(copies)
+            media_id = publish_instagram_carousel(account, token, urls, caption)
+        elif post_type == "story_pack":
+            # A story pack is a set of frames; Instagram publishes one Story at a
+            # time, so the first frame goes out and the rest stay in the folder.
+            image = instagram_ready_copy(original, Path(temporary.name))
+            urls, server, tunnel = temporary_urls([image])
+            media_id = publish_instagram_story(account, token, urls[0])
         else:
-            raise RuntimeError("Instagram did not finish copying the photograph in time")
-        media_id = api(
-            f"https://graph.instagram.com/{row['instagram_user_id']}/media_publish",
-            token,
-            {"creation_id": container},
-        )["id"]
+            image = instagram_ready_copy(original, Path(temporary.name))
+            try:
+                image_url, server, tunnel = temporary_url(image)
+            except Exception:
+                image_url = facebook_cdn_url_for_image(db, row["image_id"])
+            container = api(
+                f"https://graph.instagram.com/{account}/media",
+                token,
+                {"image_url": image_url, "caption": caption},
+            )["id"]
+            await_container(container, token, 120)
+            media_id = api(
+                f"https://graph.instagram.com/{account}/media_publish",
+                token,
+                {"creation_id": container},
+            )["id"]
         db.execute("UPDATE posts SET status='published',instagram_media_id=?,published_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?", (media_id, post_id))
         db.execute("UPDATE images SET used_count=used_count+1,last_used_at=CURRENT_TIMESTAMP WHERE id=?", (row["image_id"],))
         db.execute("UPDATE publish_attempts SET finished_at=CURRENT_TIMESTAMP,status='published',provider_response=? WHERE id=?", (json.dumps({"media_id": media_id}), attempt))
@@ -395,11 +519,44 @@ def publish_instagram(post_id: int) -> None:
         db.close()
 
 
+def facebook_upload_photo(page_id: str, token: str, photograph: Path, published: bool,
+                          message: str = "", raw: bool = False):
+    """Upload one photograph to a Page. Unpublished uploads become carousel items."""
+    boundary = "----SocialFlow" + secrets.token_hex(16)
+    content_type = mimetypes.guess_type(photograph.name)[0] or "image/jpeg"
+    body = bytearray()
+    fields = {"published": "true" if published else "false"}
+    if message:
+        fields["message"] = message
+    for name, value in fields.items():
+        body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode())
+    body.extend(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"source\"; filename=\"{photograph.name}\"\r\n"
+        f"Content-Type: {content_type}\r\n\r\n".encode()
+    )
+    body.extend(photograph.read_bytes())
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+    request = urllib.request.Request(
+        f"https://graph.facebook.com/v23.0/{page_id}/photos", data=bytes(body), method="POST"
+    )
+    request.add_header("Authorization", f"Bearer {token}")
+    request.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    request.add_header("User-Agent", "SocialFlow/0.1")
+    with urllib.request.urlopen(request, timeout=180) as response:
+        result = json.loads(response.read())
+    if raw:
+        return result
+    media_id = result.get("id")
+    if not media_id:
+        raise RuntimeError(f"Facebook returned no media ID for {photograph.name}: {json.dumps(result)}")
+    return media_id
+
+
 def publish_facebook(post_id: int) -> None:
     db = sqlite3.connect(DB)
     db.row_factory = sqlite3.Row
     row = db.execute(
-        """SELECT p.id,p.caption,p.hashtags_json,i.id image_id,i.source_path,fa.page_id
+        """SELECT p.id,p.caption,p.hashtags_json,p.post_type,i.id image_id,i.source_path,fa.page_id
            FROM posts p JOIN post_images pi ON pi.post_id=p.id AND pi.position=0
            JOIN images i ON i.id=pi.image_id
            JOIN facebook_accounts fa ON fa.profile_id=p.profile_id AND fa.connected=1
@@ -408,9 +565,20 @@ def publish_facebook(post_id: int) -> None:
     ).fetchone()
     if not row:
         raise RuntimeError("Post, photograph or connected Facebook Page was not found")
-    image = Path(row["source_path"])
-    if not image.is_file():
-        raise RuntimeError(f"Original photograph is unavailable: {image.name}")
+    # Every photograph, not just the first. Sending only position 0 silently
+    # published one frame of a seven-photograph post and reported success.
+    photographs = [
+        Path(item["source_path"])
+        for item in db.execute(
+            """SELECT i.source_path FROM post_images pi JOIN images i ON i.id=pi.image_id
+               WHERE pi.post_id=? ORDER BY pi.position""",
+            (post_id,),
+        ).fetchall()
+    ]
+    missing = [path.name for path in photographs if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"Original photograph is unavailable: {', '.join(missing[:3])}")
+    image = photographs[0]
     token = subprocess.check_output(
         ["/usr/bin/security", "find-generic-password", "-s", "com.socialflow.desktop.facebook", "-a", row["page_id"], "-w"],
         text=True,
@@ -422,23 +590,19 @@ def publish_facebook(post_id: int) -> None:
     attempt = db.execute("SELECT last_insert_rowid()").fetchone()[0]
     db.commit()
     try:
-        boundary = "----SocialFlow" + secrets.token_hex(16)
-        content_type = mimetypes.guess_type(image.name)[0] or "image/jpeg"
-        body = bytearray()
-        body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"message\"\r\n\r\n{message}\r\n".encode())
-        body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"source\"; filename=\"{image.name}\"\r\nContent-Type: {content_type}\r\n\r\n".encode())
-        body.extend(image.read_bytes())
-        body.extend(f"\r\n--{boundary}--\r\n".encode())
-        request = urllib.request.Request(
-            f"https://graph.facebook.com/v23.0/{row['page_id']}/photos",
-            data=bytes(body),
-            method="POST",
-        )
-        request.add_header("Authorization", f"Bearer {token}")
-        request.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-        request.add_header("User-Agent", "SocialFlow/0.1")
-        with urllib.request.urlopen(request, timeout=120) as response:
-            result = json.loads(response.read())
+        if len(photographs) > 1:
+            # Upload each photograph unpublished, then attach them all to one
+            # feed post so the Page shows the whole set.
+            attached = []
+            for photograph in photographs[:10]:
+                uploaded = facebook_upload_photo(row["page_id"], token, photograph, published=False)
+                attached.append(uploaded)
+            fields = {"message": message}
+            for index, media_id in enumerate(attached):
+                fields[f"attached_media[{index}]"] = json.dumps({"media_fbid": media_id})
+            result = api(f"https://graph.facebook.com/v23.0/{row['page_id']}/feed", token, fields)
+        else:
+            result = facebook_upload_photo(row["page_id"], token, image, published=True, message=message, raw=True)
         external_id = result.get("post_id") or result.get("id")
         if not external_id:
             raise RuntimeError("Facebook accepted the request but returned no post ID")

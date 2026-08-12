@@ -13,7 +13,11 @@
     "security": {
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPDATA/**", "$APPCACHE/**", "**"]
+        "scope": [
+          "$APPDATA/**",
+          "$APPCACHE/**",
+          "**"
+        ]
       }
     },
     "windows": [
@@ -30,11 +34,23 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
-    "icon": ["icons/icon.icns", "icons/icon.png"],
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "icon": [
+      "icons/icon.icns",
+      "icons/icon.png"
+    ],
     "category": "Photography",
     "shortDescription": "Photography-first Instagram campaign planning",
     "longDescription": "A local-first macOS application for professional photographers to curate, schedule and publish campaigns.",
-    "macOS": { "minimumSystemVersion": "11.0" }
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    },
+    "resources": {
+      "../scripts/socialflow_live_publisher.py": "scripts/socialflow_live_publisher.py",
+      "../scripts/socialflow_tiktok_oauth.py": "scripts/socialflow_tiktok_oauth.py"
+    }
   }
 }
