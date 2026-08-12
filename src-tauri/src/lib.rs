@@ -296,6 +296,18 @@ fn migrations(c: &Connection) -> rusqlite::Result<()> {
         // call is arithmetic over aggregates and runs on the cheapest.
         c.execute_batch("INSERT OR IGNORE INTO app_settings(key,value)VALUES('claude_model_vision','sonnet'),('claude_model_strategy','haiku'),('claude_model_diagnosis','sonnet'),('last_vision_provider',''),('last_vision_error',''); INSERT INTO schema_migrations(version)VALUES(11);")?;
     }
+    let has_v12 = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=12)",
+        [],
+        |r| r.get::<_, bool>(0),
+    )?;
+    if !has_v12 {
+        // Volume decides the tier, not importance. Strategy runs once a week and
+        // diagnosis only after a failure, so both are far too small to be worth
+        // economising on. Vision is the only high-volume caller — roughly one
+        // batch per five photographs — so it stays on the mid-tier model.
+        c.execute_batch("UPDATE app_settings SET value='opus' WHERE key IN ('claude_model_strategy','claude_model_diagnosis'); INSERT INTO schema_migrations(version)VALUES(12);")?;
+    }
     c.execute(
         "INSERT OR IGNORE INTO app_settings(key,value)VALUES('posting_time_mode','suggest')",
         [],

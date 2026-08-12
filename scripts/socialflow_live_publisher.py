@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import signal
+import socket
 import sqlite3
 import subprocess
 import tempfile
@@ -246,7 +247,10 @@ def _tunnel_for(tokens: list[str]):
     last_error = ""
     # Quick tunnels occasionally receive an edge hostname whose DNS record is
     # not usable. Replace that tunnel automatically instead of failing a post.
-    for _attempt in range(3):
+    # A fresh trycloudflare hostname routinely takes 30-60s to resolve
+    # everywhere, so each tunnel gets a long readiness window before being
+    # replaced, and there are more attempts than there used to be.
+    for _attempt in range(5):
         tunnel = subprocess.Popen(
             [CLOUDFLARED, "tunnel", "--url", f"http://127.0.0.1:{server.server_port}", "--no-autoupdate"],
             stdout=subprocess.DEVNULL,
@@ -265,7 +269,17 @@ def _tunnel_for(tokens: list[str]):
                 break
         if public:
             urls = [f"{public}/{token}" for token in tokens]
-            readiness_deadline = time.time() + 35
+            # Wait for DNS to exist at all before spending the readiness window
+            # on requests that cannot possibly succeed.
+            host = urllib.parse.urlparse(public).hostname or ""
+            dns_deadline = time.time() + 60
+            while time.time() < dns_deadline:
+                try:
+                    socket.getaddrinfo(host, 443)
+                    break
+                except socket.gaierror:
+                    time.sleep(3)
+            readiness_deadline = time.time() + 90
             while time.time() < readiness_deadline:
                 # Probe the first file only: once one edge serves this tunnel the
                 # rest are reachable, and probing a large video wastes the window.
@@ -289,6 +303,73 @@ def _tunnel_for(tokens: list[str]):
             tunnel.kill()
     server.shutdown()
     raise RuntimeError(f"Temporary secure media link was not ready after automatic tunnel replacement: {last_error}")
+
+
+def facebook_page_credentials(db: sqlite3.Connection):
+    """Page ID and token for the connected Page, or None."""
+    row = db.execute("SELECT page_id FROM facebook_accounts WHERE connected=1 LIMIT 1").fetchone()
+    if not row:
+        return None
+    page_id = row["page_id"] if isinstance(row, sqlite3.Row) else row[0]
+    try:
+        token = subprocess.check_output(
+            ["/usr/bin/security", "find-generic-password", "-s", "com.socialflow.desktop.facebook",
+             "-a", page_id, "-w"], text=True,
+        ).strip()
+    except subprocess.CalledProcessError:
+        return None
+    return page_id, token
+
+
+def meta_cdn_urls(page_id: str, page_token: str, paths: list[Path]) -> tuple[list[str], list[str]]:
+    """Stage photographs on Meta's own CDN and return their URLs.
+
+    Instagram fetching from Meta removes the quick tunnel — and with it the
+    "could not resolve host" failures that are the single largest cause of
+    failed posts. The staged photographs are uploaded unpublished, so they never
+    appear on the Page, and are deleted once Instagram has copied them.
+    """
+    urls, staged = [], []
+    for photograph in paths:
+        media_id = facebook_upload_photo(page_id, page_token, photograph, published=False)
+        staged.append(media_id)
+        detail = api(
+            f"https://graph.facebook.com/v23.0/{media_id}?fields=images&access_token={urllib.parse.quote(page_token)}",
+            page_token,
+        )
+        candidates = detail.get("images") or []
+        if not candidates:
+            raise RuntimeError(f"Meta returned no CDN image for {photograph.name}")
+        best = max(candidates, key=lambda item: item.get("width", 0) * item.get("height", 0))
+        urls.append(best["source"])
+    return urls, staged
+
+
+def discard_staged_media(page_token: str, staged: list[str]) -> None:
+    for media_id in staged:
+        try:
+            request = urllib.request.Request(
+                f"https://graph.facebook.com/v23.0/{media_id}?access_token={urllib.parse.quote(page_token)}",
+                method="DELETE",
+            )
+            urllib.request.urlopen(request, timeout=30).close()
+        except Exception:
+            # Staging cleanup must never fail a published post.
+            pass
+
+
+def public_urls_for(db: sqlite3.Connection, paths: list[Path]):
+    """(urls, server, tunnel, page_token, staged) — Meta CDN first, tunnel second."""
+    credentials = facebook_page_credentials(db)
+    if credentials:
+        page_id, page_token = credentials
+        try:
+            urls, staged = meta_cdn_urls(page_id, page_token, paths)
+            return urls, None, None, page_token, staged
+        except Exception as error:
+            print(f"Meta CDN staging unavailable, falling back to tunnel: {error}", flush=True)
+    urls, server, tunnel = temporary_urls(paths)
+    return urls, server, tunnel, None, []
 
 
 def await_container(container: str, token: str, limit: int) -> None:
@@ -365,8 +446,57 @@ def publish_instagram_story(account: str, token: str, image_url: str) -> str:
     )["id"]
 
 
+def image_dimensions(path: Path) -> tuple[int, int]:
+    result = subprocess.run(
+        ["/usr/bin/sips", "-g", "pixelWidth", "-g", "pixelHeight", str(path)],
+        capture_output=True, text=True,
+    )
+    values = dict(
+        line.strip().split(": ", 1)
+        for line in result.stdout.splitlines()
+        if ": " in line
+    )
+    return int(values.get("pixelWidth", 0)), int(values.get("pixelHeight", 0))
+
+
+# Instagram accepts 4:5 (0.80) through 1.91:1. Anything outside is refused with
+# an "aspect ratio ()" message that names neither the photograph nor the ratio.
+NARROWEST, WIDEST = 0.8, 1.91
+
+
+def aspect_safe_copy(source: Path, folder: Path, name: str) -> Path:
+    """Centre-crop into Instagram's accepted range, only when necessary.
+
+    A panorama or a tall crop is otherwise rejected at publish time. Cropping
+    happens on a copy; the photographer's original is never touched.
+    """
+    width, height = image_dimensions(source)
+    if width <= 0 or height <= 0:
+        return source
+    ratio = width / height
+    if NARROWEST <= ratio <= WIDEST:
+        return source
+    if ratio > WIDEST:
+        target_width, target_height = int(height * WIDEST), height
+    else:
+        target_width, target_height = width, int(width / NARROWEST)
+    cropped = folder / f"crop-{name}"
+    result = subprocess.run(
+        ["/usr/bin/sips", "--cropToHeightWidth", str(target_height), str(target_width),
+         str(source), "--out", str(cropped)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not cropped.is_file():
+        raise RuntimeError(
+            f"Could not fit {source.name} ({width}x{height}, ratio {ratio:.2f}) to Instagram's "
+            f"accepted range: {result.stderr.strip()}"
+        )
+    return cropped
+
+
 def instagram_ready_copy(source: Path, folder: Path, name: str = "socialflow-instagram.jpg") -> Path:
     """Create a standard-size sRGB JPEG without altering the photographer's file."""
+    source = aspect_safe_copy(source, folder, name)
     output = folder / name
     result = subprocess.run(
         [
@@ -459,6 +589,7 @@ def publish_instagram(post_id: int) -> None:
     attempt = db.execute("SELECT last_insert_rowid()").fetchone()[0]
     db.commit()
     server = tunnel = None
+    page_token, staged = None, []
     temporary = tempfile.TemporaryDirectory(prefix="socialflow-instagram-")
     try:
         account = row["instagram_user_id"]
@@ -472,20 +603,18 @@ def publish_instagram(post_id: int) -> None:
                 instagram_ready_copy(source, folder, f"carousel-{index:02d}.jpg")
                 for index, source in enumerate(sources[:10])
             ]
-            urls, server, tunnel = temporary_urls(copies)
+            urls, server, tunnel, page_token, staged = public_urls_for(db, copies)
             media_id = publish_instagram_carousel(account, token, urls, caption)
         elif post_type == "story_pack":
             # A story pack is a set of frames; Instagram publishes one Story at a
             # time, so the first frame goes out and the rest stay in the folder.
             image = instagram_ready_copy(original, Path(temporary.name))
-            urls, server, tunnel = temporary_urls([image])
+            urls, server, tunnel, page_token, staged = public_urls_for(db, [image])
             media_id = publish_instagram_story(account, token, urls[0])
         else:
             image = instagram_ready_copy(original, Path(temporary.name))
-            try:
-                image_url, server, tunnel = temporary_url(image)
-            except Exception:
-                image_url = facebook_cdn_url_for_image(db, row["image_id"])
+            urls, server, tunnel, page_token, staged = public_urls_for(db, [image])
+            image_url = urls[0]
             container = api(
                 f"https://graph.instagram.com/{account}/media",
                 token,
@@ -515,6 +644,8 @@ def publish_instagram(post_id: int) -> None:
                 tunnel.kill()
         if server:
             server.shutdown()
+        if page_token and staged:
+            discard_staged_media(page_token, staged)
         temporary.cleanup()
         db.close()
 
