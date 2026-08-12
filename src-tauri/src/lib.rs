@@ -327,8 +327,12 @@ fn migrations(c: &Connection) -> rusqlite::Result<()> {
     if !has_v14 {
         // Generated posts go straight to the queue and publish at their time.
         // Set require_approval to 'true' to put the review gate back.
-        c.execute_batch("INSERT OR IGNORE INTO app_settings(key,value)VALUES('require_approval','false'); INSERT INTO schema_migrations(version)VALUES(14);")?;
+        c.execute_batch("INSERT OR IGNORE INTO app_settings(key,value)VALUES('require_approval','false'),('recycle_after_days','90'); INSERT INTO schema_migrations(version)VALUES(14);")?;
     }
+    c.execute(
+        "INSERT OR IGNORE INTO app_settings(key,value)VALUES('recycle_after_days','90')",
+        [],
+    )?;
     c.execute(
         "INSERT OR IGNORE INTO app_settings(key,value)VALUES('posting_time_mode','suggest')",
         [],
@@ -888,6 +892,71 @@ const CHILD_TERMS: [&str; 10] = [
     "child", "kid", "boy", "girl", "baby", "babies", "toddler", "infant",
     "page boy", "daughter",
 ];
+
+/// Photographs available to a new campaign: unused first, then the longest-
+/// rested previously-published ones once the fresh material runs out.
+///
+/// A wedding library is finite. Rather than stopping when every frame has been
+/// posted once, the oldest published photographs come back into rotation in new
+/// combinations — never one already sitting in a pending post, and never one
+/// posted inside the resting period.
+fn available_images(c: &Connection, candidates: Vec<i64>, needed: usize) -> (Vec<i64>, usize) {
+    let pending_or_used = |id: &i64| -> bool {
+        c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM post_images WHERE image_id=?)",
+            [id],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(true)
+    };
+    let fresh = candidates
+        .iter()
+        .copied()
+        .filter(|id| !pending_or_used(id))
+        .collect::<Vec<_>>();
+    if fresh.len() >= needed {
+        return (fresh, 0);
+    }
+    let rest_days: i64 = c
+        .query_row("SELECT CAST(value AS INTEGER) FROM app_settings WHERE key='recycle_after_days'", [], |r| r.get(0))
+        .unwrap_or(90);
+    let mut recycled = Vec::new();
+    for id in &candidates {
+        // Never touch a photograph that is in a post still waiting to go out.
+        let in_pending: bool = c
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM post_images pi JOIN posts p ON p.id=pi.post_id WHERE pi.image_id=? AND p.status IN ('draft','needs_review','approved','scheduled','publishing'))",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap_or(true);
+        if in_pending || fresh.contains(id) {
+            continue;
+        }
+        let rested: Option<(i64, String)> = c
+            .query_row(
+                "SELECT COALESCE(i.used_count,0),COALESCE(MAX(p.published_at),'') FROM images i LEFT JOIN post_images pi ON pi.image_id=i.id LEFT JOIN posts p ON p.id=pi.post_id AND p.status='published' WHERE i.id=? GROUP BY i.id",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        if let Some((used, last)) = rested {
+            let long_enough = last.is_empty()
+                || NaiveDate::parse_from_str(&last[..10.min(last.len())], "%Y-%m-%d")
+                    .map(|when| (Local::now().date_naive() - when).num_days() >= rest_days)
+                    .unwrap_or(false);
+            if long_enough {
+                recycled.push((*id, used, last));
+            }
+        }
+    }
+    // Least-posted first, then longest-rested.
+    recycled.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+    let mut available = fresh;
+    let recycled_count = recycled.len();
+    available.extend(recycled.into_iter().map(|(id, _, _)| id));
+    (available, recycled_count)
+}
 
 fn marketing_safe_images(
     c: &Connection,
@@ -1724,18 +1793,15 @@ fn build_content_campaign(
     let wedding_date_for_curation = tx
         .query_row("SELECT wedding_date FROM weddings WHERE id=?", [wedding_id], |r| r.get::<_, String>(0))
         .unwrap_or_default();
-    let mut ids = marketing_safe_images(&tx, wedding_id, image_ids)?;
-    ids.retain(|id| {
-        !tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM post_images WHERE image_id=?)",
-            [id],
-            |r| r.get::<_, bool>(0),
-        )
-        .unwrap_or(true)
-    });
+    let safe = marketing_safe_images(&tx, wedding_id, image_ids)?;
+    // A day needs roughly fifty photographs; ask for more so there is choice.
+    let (mut ids, recycled) = available_images(&tx, safe, count.saturating_mul(12).max(60));
+    if recycled > 0 {
+        println!("{couple}: fresh material exhausted, {recycled} rested photographs back in rotation");
+    }
     ids = rank_campaign_images(&tx, ids);
     if ids.is_empty() {
-        return Err("Every photograph in this wedding is already assigned to content".into());
+        return Err("No photographs are available for this wedding yet — the rest are still resting after a recent post".into());
     }
     let start = Local::now().date_naive();
     let facebook_separate = tx.query_row("SELECT EXISTS(SELECT 1 FROM facebook_accounts WHERE profile_id=? AND connected=1) AND COALESCE((SELECT value FROM app_settings WHERE key='facebook_separate_posts'),'false')='true'", [profile_id], |r| r.get::<_,bool>(0)).unwrap_or(false);
@@ -2203,9 +2269,13 @@ fn ai_curate(
     let mut catalogue = String::new();
     for id in candidates.iter().take(70) {
         if let Ok(line) = c.query_row(
-            "SELECT COALESCE(a.sub_category,''),COALESCE(a.mood,''),COALESCE(a.social_score,0),substr(COALESCE(a.description,''),1,150) FROM image_analysis a WHERE a.image_id=?",
+            "SELECT COALESCE(a.sub_category,''),COALESCE(a.mood,''),COALESCE(a.social_score,0),substr(COALESCE(a.description,''),1,150),COALESCE((SELECT MAX(p.published_at) FROM post_images pi JOIN posts p ON p.id=pi.post_id AND p.status='published' WHERE pi.image_id=a.image_id),'') FROM image_analysis a WHERE a.image_id=?",
             [id],
-            |r| Ok(format!("  {} | {} | {} | score {} | {}\n", id, r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,String>(3)?)),
+            |r| {
+                let posted: String = r.get(4)?;
+                let note = if posted.is_empty() { String::new() } else { format!(" | PREVIOUSLY POSTED {}", &posted[..10.min(posted.len())]) };
+                Ok(format!("  {} | {} | {} | score {} | {}{}\n", id, r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,String>(3)?, note))
+            },
         ) {
             catalogue.push_str(&line);
         }
@@ -2223,7 +2293,7 @@ fn ai_curate(
         .unwrap_or_default();
     let wanted = quota.iter().map(|(f, n)| format!("{n} {f}")).collect::<Vec<_>>().join(", ");
     let prompt = format!(
-        "You are curating one day of Instagram content for Wayne, a documentary wedding photographer in the North West of England. Audience: UK couples planning weddings in Lancashire, Cheshire, Greater Manchester, Merseyside and the Lake District.\n\nWedding: {couple} at {venue}, {wedding_date}.\nConfirmed suppliers to credit where it fits naturally: {suppliers}\n\nProduce exactly: {wanted}.\n\nRules:\n- carousel: 3 to 10 photographs, chosen as a SEQUENCE that opens on the strongest frame and reads as a small story. Not simply the highest scores.\n- reel: 8 to 14 photographs in an order that builds. Set seconds_per_photo between 1.2 and 2.5 to suit the pace of the moment.\n- story_pack: 1 photograph that stands completely on its own.\n- Never use the same photograph in two posts.\n- Only use image_ids from the catalogue below.\n- Captions: Wayne's voice — dry, observant, specifically human, British. At least three non-empty lines. Never sentimental, never a cliche, never 'capturing memories' or 'magical moment'. Do not invent names, dialogue or facts you cannot see.\n- Weave a supplier credit into a caption only where it genuinely fits; otherwise omit it.\n- 4 to 6 hashtags per post, including at least one North West locality tag a searching couple would use.\n- Do not repeat the openings of these recent captions:\n  {recent_captions}\n\nMeasured performance to weigh:\n{}\nPhotograph catalogue — id | moment | mood | score | description:\n{}",
+        "You are curating one day of Instagram content for Wayne, a documentary wedding photographer in the North West of England. Audience: UK couples planning weddings in Lancashire, Cheshire, Greater Manchester, Merseyside and the Lake District.\n\nWedding: {couple} at {venue}, {wedding_date}.\nConfirmed suppliers to credit where it fits naturally: {suppliers}\n\nProduce exactly: {wanted}.\n\nRules:\n- carousel: 3 to 10 photographs, chosen as a SEQUENCE that opens on the strongest frame and reads as a small story. Not simply the highest scores.\n- reel: 8 to 14 photographs in an order that builds. Set seconds_per_photo between 1.2 and 2.5 to suit the pace of the moment.\n- story_pack: 1 photograph that stands completely on its own.\n- Never use the same photograph in two posts.\n- Only use image_ids from the catalogue below.\n- Captions: Wayne's voice — dry, observant, specifically human, British. At least three non-empty lines. Never sentimental, never a cliche, never 'capturing memories' or 'magical moment'. Do not invent names, dialogue or facts you cannot see.\n- Weave a supplier credit into a caption only where it genuinely fits; otherwise omit it.\n- 4 to 6 hashtags per post, including at least one North West locality tag a searching couple would use.\n- Do not repeat the openings of these recent captions:\n  {recent_captions}\n- Some photographs are marked PREVIOUSLY POSTED. They may be used again, but place them in a different set and a different order than an obvious repeat, and write a caption that finds a different angle on the same moment. Prefer unmarked photographs where the quality is comparable.\n\nMeasured performance to weigh:\n{}\nPhotograph catalogue — id | moment | mood | score | description:\n{}",
         strategy_evidence(c),
         catalogue
     );
@@ -4286,6 +4356,26 @@ mod tests {
         assert!(!out.contains(&"#weddingstorytelling".to_string()), "saturated tag must be replaced");
         assert!(out.contains(&"#fresh".to_string()), "unsaturated tag must survive");
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn exhausted_weddings_recycle_only_rested_photographs() {
+        let c = Connection::open_in_memory().unwrap();
+        migrations(&c).unwrap();
+        for id in 1..=3 {
+            c.execute("INSERT INTO images(id,source_path,filename,file_hash,file_size)VALUES(?,?,?,?,0)",
+                params![id, format!("/tmp/{id}.jpg"), format!("{id}.jpg"), format!("h{id}")]).unwrap();
+        }
+        // 1 published long ago, 2 published yesterday, 3 sitting in a scheduled post.
+        c.execute("INSERT INTO posts(id,profile_id,status,published_at)VALUES(1,1,'published',datetime('now','-200 days'))",[]).unwrap();
+        c.execute("INSERT INTO posts(id,profile_id,status,published_at)VALUES(2,1,'published',datetime('now','-1 day'))",[]).unwrap();
+        c.execute("INSERT INTO posts(id,profile_id,status,scheduled_at)VALUES(3,1,'scheduled',datetime('now','+1 day'))",[]).unwrap();
+        for (post, image) in [(1, 1), (2, 2), (3, 3)] {
+            c.execute("INSERT INTO post_images(post_id,image_id,position)VALUES(?,?,0)", params![post, image]).unwrap();
+        }
+        let (available, recycled) = available_images(&c, vec![1, 2, 3], 5);
+        assert_eq!(recycled, 1, "only the long-rested photograph returns");
+        assert_eq!(available, vec![1], "not the recent one, and never one already queued");
     }
 
     #[test]
