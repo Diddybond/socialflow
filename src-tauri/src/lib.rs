@@ -939,6 +939,63 @@ fn caption_too_similar(c: &Connection, caption: &str) -> bool {
 /// The Autopilot screen claims "caption and hashtag repetition" is checked;
 /// only captions ever were. A tag used in more than a third of the last thirty
 /// posts is replaced with an unused regional alternative.
+/// Regional tags for the audience this account is trying to reach: couples
+/// marrying in the North West of England.
+const NORTH_WEST_TAGS: [&str; 8] = [
+    "#lancashireweddingphotographer",
+    "#cheshireweddingphotographer",
+    "#lakedistrictweddingphotographer",
+    "#northwestweddingphotographer",
+    "#manchesterweddingphotographer",
+    "#liverpoolweddingphotographer",
+    "#ribblevalleywedding",
+    "#yorkshireweddingphotographer",
+];
+
+/// Ensure at least one North West locality tag is present.
+///
+/// Captions and tags come from the vision model, which describes what it can
+/// see and has no idea who the account is trying to reach. Without this a set
+/// of otherwise good tags can carry no geography at all.
+fn ensure_regional_reach(c: &Connection, mut tags: Vec<String>, index: usize) -> Vec<String> {
+    let has_region = tags.iter().any(|tag| {
+        let lower = tag.to_lowercase();
+        NORTH_WEST_TAGS.iter().any(|regional| lower == *regional)
+            || ["lancashire", "cheshire", "lakedistrict", "northwest", "manchester", "liverpool"]
+                .iter()
+                .any(|place| lower.contains(place))
+    });
+    if has_region {
+        return tags;
+    }
+    // Rotate through the regional tags, preferring one not used recently.
+    let recent = c
+        .prepare("SELECT hashtags_json FROM posts WHERE hashtags_json NOT IN ('','[]') ORDER BY id DESC LIMIT 12")
+        .ok()
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |r| r.get::<_, String>(0))
+                .ok()
+                .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+        })
+        .unwrap_or_default()
+        .join(" ")
+        .to_lowercase();
+    let choice = NORTH_WEST_TAGS
+        .iter()
+        .cycle()
+        .skip(index % NORTH_WEST_TAGS.len())
+        .take(NORTH_WEST_TAGS.len())
+        .find(|tag| !recent.contains(&tag.to_lowercase()))
+        .copied()
+        .unwrap_or(NORTH_WEST_TAGS[index % NORTH_WEST_TAGS.len()]);
+    if tags.len() >= 5 {
+        tags.pop();
+    }
+    tags.push(choice.to_string());
+    tags
+}
+
 fn diversify_hashtags(c: &Connection, tags: Vec<String>) -> Vec<String> {
     let recent = c
         .prepare("SELECT hashtags_json FROM posts WHERE hashtags_json NOT IN ('','[]') ORDER BY id DESC LIMIT 30")
@@ -1298,6 +1355,7 @@ fn create_campaign(
             .map(|analysis| analysis.hashtags)
             .unwrap_or_else(|| wedding_hashtags(&venue, &category, i));
         add_supplier_context(&tx, wedding_id, &mut caption, i);
+        let tag_list = ensure_regional_reach(&tx, tag_list, i);
         let tags = serde_json::to_string(&diversify_hashtags(&tx, tag_list)).unwrap();
         tx.execute("INSERT INTO posts(profile_id,caption,hashtags_json,status,scheduled_at,post_type,ai_generated)VALUES(?,?,?,'needs_review',?,'single',1)",params![profile_id,caption,tags,d.to_string()]).map_err(|e|e.to_string())?;
         let post = tx.last_insert_rowid();
@@ -1582,7 +1640,8 @@ fn create_content_campaign(
     posts_per_day: u32,
     wedding_id: i64,
     formats: Vec<String>,
-    per_type_per_day: Option<u32>,
+    daily_quota: Option<HashMap<String, u32>>,
+    format_offset: Option<usize>,
     state: State<AppState>,
 ) -> Result<i64, String> {
     if image_ids.is_empty() || formats.is_empty() {
@@ -1624,12 +1683,12 @@ fn create_content_campaign(
     let campaign_id = tx.last_insert_rowid();
     // Strongest measured format first, then fill the daily quota of each type.
     let ranked = formats_by_evidence(&tx, &formats);
-    let quota = per_type_per_day.unwrap_or(0);
-    let plan = format_plan(&ranked, count, quota);
-    let daily_total = if quota > 0 {
-        (quota as usize * ranked.len().max(1)) as u32
-    } else {
+    let quota = daily_quota.unwrap_or_default();
+    let plan = format_plan(&ranked, count, &quota, format_offset.unwrap_or(0));
+    let daily_total = if quota.is_empty() {
         posts_per_day
+    } else {
+        daily_cycle_length(&ranked, &quota) as u32
     };
     let mut cursor = 0usize;
     for index in 0..count {
@@ -1664,6 +1723,7 @@ fn create_content_campaign(
             .map(|analysis| analysis.hashtags)
             .unwrap_or_else(|| wedding_hashtags(&venue, &category, index));
         add_supplier_context(&tx, Some(wedding_id), &mut caption, index);
+        let tag_list = ensure_regional_reach(&tx, tag_list, index);
         let tags = serde_json::to_string(&diversify_hashtags(&tx, tag_list)).unwrap();
         let learned_hours = learned_posting_hours(&tx, posts_per_day.clamp(1, 5) as usize);
         let minutes = daily_slot_minutes(daily_total.max(1) as usize, &learned_hours);
@@ -1864,20 +1924,47 @@ fn reflow_wedding_rotation(
 }
 /// Minutes-past-midnight for `count` posts in a day.
 ///
-/// Up to five posts use the learned or curated hours. Beyond that there are
-/// more posts than good hours, so they are spread evenly across 08:00-21:00 —
-/// hour granularity would stack several posts on the same minute.
+/// The measured best hours are used first and always kept — they are the whole
+/// point of learning from insights. When a day needs more posts than there are
+/// good hours, the extras are placed in the widest remaining gaps between
+/// 08:00 and 21:00, so the strongest times stay strongest and the rest spread
+/// out rather than bunching.
 fn daily_slot_minutes(count: usize, learned: &[u32]) -> Vec<u32> {
-    if count <= learned.len() && !learned.is_empty() {
-        return learned.iter().take(count).map(|hour| hour * 60).collect();
+    if count == 0 {
+        return Vec::new();
     }
-    if count <= 1 {
-        return vec![19 * 60];
+    let (open, close) = (8 * 60u32, 21 * 60u32);
+    let mut slots: Vec<u32> = learned
+        .iter()
+        .map(|hour| (hour * 60).clamp(open, close))
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    if slots.is_empty() {
+        slots.push(19 * 60);
     }
-    let (start, end) = (8 * 60u32, 21 * 60u32);
-    (0..count)
-        .map(|index| start + ((end - start) as usize * index / (count - 1)) as u32)
-        .collect()
+    slots.truncate(count);
+    while slots.len() < count {
+        // Widest gap, counting the ends of the day as gaps too.
+        let mut best = (0usize, 0u32, 0u32);
+        let mut edges = vec![open];
+        edges.extend(slots.iter().copied());
+        edges.push(close);
+        for window in 0..edges.len() - 1 {
+            let span = edges[window + 1].saturating_sub(edges[window]);
+            if span > best.1 {
+                best = (window, span, edges[window] + span / 2);
+            }
+        }
+        if best.1 < 30 {
+            break;
+        }
+        slots.push(best.2);
+        slots.sort_unstable();
+        slots.dedup();
+    }
+    slots.truncate(count);
+    slots
 }
 
 fn slot_at(day: NaiveDate, minutes: u32) -> chrono::DateTime<Local> {
@@ -1928,39 +2015,50 @@ fn formats_by_evidence(c: &Connection, requested: &[String]) -> Vec<String> {
     scored.into_iter().map(|(format, _, _)| format).collect()
 }
 
-/// One format per post, filling `per_type_per_day` of every format each day.
+/// One format per post, following a repeating daily cycle.
 ///
-/// Within a day the strongest format takes the earliest (best-evidence) slot.
-fn format_plan(ranked: &[String], count: usize, per_type_per_day: u32) -> Vec<String> {
+/// `quota` gives how many of each format a day should contain, e.g. five
+/// carousels, one Reel, one Story. `offset` is how many posts the week has
+/// already produced, so a campaign built per wedding continues the same cycle
+/// instead of restarting it — ten weddings each restarting at zero is how a
+/// week ended up 50/50/5 instead of an even mix.
+fn format_plan(
+    ranked: &[String],
+    count: usize,
+    quota: &HashMap<String, u32>,
+    offset: usize,
+) -> Vec<String> {
     if ranked.is_empty() {
         return Vec::new();
     }
-    let mut plan = Vec::with_capacity(count);
-    if per_type_per_day == 0 {
-        // No quota: weight the rotation towards the stronger formats by giving
-        // the leader one extra turn per cycle.
-        while plan.len() < count {
-            for (position, format) in ranked.iter().enumerate() {
-                let turns = if position == 0 { 2 } else { 1 };
-                for _ in 0..turns {
-                    if plan.len() < count {
-                        plan.push(format.clone());
-                    }
-                }
-            }
+    let mut cycle = Vec::new();
+    for format in ranked {
+        for _ in 0..quota.get(format).copied().unwrap_or(0) {
+            cycle.push(format.clone());
         }
-        return plan;
     }
-    while plan.len() < count {
-        for format in ranked {
-            for _ in 0..per_type_per_day {
-                if plan.len() < count {
-                    plan.push(format.clone());
-                }
+    if cycle.is_empty() {
+        // No quota given: weight the rotation towards the stronger formats by
+        // giving the leader one extra turn per cycle.
+        for (position, format) in ranked.iter().enumerate() {
+            cycle.push(format.clone());
+            if position == 0 {
+                cycle.push(format.clone());
             }
         }
     }
-    plan
+    (0..count)
+        .map(|index| cycle[(offset + index) % cycle.len()].clone())
+        .collect()
+}
+
+/// How many posts one day holds under `quota`.
+fn daily_cycle_length(ranked: &[String], quota: &HashMap<String, u32>) -> usize {
+    let total: u32 = ranked
+        .iter()
+        .map(|format| quota.get(format).copied().unwrap_or(0))
+        .sum();
+    total.max(1) as usize
 }
 
 fn brand_caption(couple: &str, venue: &str, category: &str, index: usize) -> String {
@@ -2301,7 +2399,7 @@ fn vision_prompt(items: &[(i64, String)], couple: &str, venue: &str) -> String {
         .map(|(id, path)| format!("image_id {id}: {path}"))
         .collect::<Vec<_>>()
         .join("\n");
-    format!("Visually inspect every supplied wedding preview. Return a JSON object with a results array containing one result per image_id. Identify the real wedding-day section from visible evidence, describe the specific human moment and mood, and write a unique Instagram caption in Wayne's natural British documentary voice. The caption must have at least three non-empty lines, be emotionally observant rather than sentimental, and never invent names, dialogue, relationships or facts not visible. Avoid clichés including 'capturing memories', 'magical moment', 'love was in the air', 'picture perfect', and 'a day to remember'. Add exactly five relevant hashtags beginning with #, including useful venue, location and category terms only where justified. Couple: {couple}. Venue: {venue}.\n\n{list}")
+    format!("Visually inspect every supplied wedding preview. Return a JSON object with a results array containing one result per image_id. Identify the real wedding-day section from visible evidence, describe the specific human moment and mood, and write a unique Instagram caption in Wayne's natural British documentary voice. The caption must have at least three non-empty lines, be emotionally observant rather than sentimental, and never invent names, dialogue, relationships or facts not visible. Avoid clichés including 'capturing memories', 'magical moment', 'love was in the air', 'picture perfect', and 'a day to remember'. Add exactly five relevant hashtags beginning with #, including useful venue, location and category terms only where justified. The audience is couples planning weddings in the North West of England — Lancashire, Cheshire, Greater Manchester, Merseyside and the Lake District — so favour hashtags that a British couple searching for a photographer in that region would actually use. Couple: {couple}. Venue: {venue}.\n\n{list}")
 }
 
 fn run_with_timeout(
@@ -3343,16 +3441,44 @@ mod tests {
     }
 
     #[test]
-    fn format_plan_fills_a_daily_quota_of_each_type() {
+    fn a_week_follows_the_daily_quota_exactly() {
+        // Five carousels, one Reel, one Story a day, over seven days.
         let ranked = vec!["carousel".to_string(), "reel".to_string(), "story_pack".to_string()];
-        let plan = format_plan(&ranked, 105, 5);
-        assert_eq!(plan.len(), 105);
-        for format in &ranked {
-            assert_eq!(plan.iter().filter(|item| *item == format).count(), 35,
-                "{format}: five a day across seven days");
+        let quota = HashMap::from([
+            ("carousel".to_string(), 5u32),
+            ("reel".to_string(), 1),
+            ("story_pack".to_string(), 1),
+        ]);
+        let plan = format_plan(&ranked, 49, &quota, 0);
+        assert_eq!(plan.iter().filter(|f| *f == "carousel").count(), 35);
+        assert_eq!(plan.iter().filter(|f| *f == "reel").count(), 7);
+        assert_eq!(plan.iter().filter(|f| *f == "story_pack").count(), 7);
+        assert_eq!(daily_cycle_length(&ranked, &quota), 7);
+    }
+
+    #[test]
+    fn the_cycle_continues_across_weddings() {
+        // Ten weddings built separately must still total the week's quota.
+        let ranked = vec!["carousel".to_string(), "reel".to_string(), "story_pack".to_string()];
+        let quota = HashMap::from([
+            ("carousel".to_string(), 5u32),
+            ("reel".to_string(), 1),
+            ("story_pack".to_string(), 1),
+        ]);
+        let mut totals = HashMap::<String, usize>::new();
+        let mut remaining = 49usize;
+        let mut produced = 0usize;
+        for wedding in 0..10 {
+            let count = remaining.div_ceil(10 - wedding);
+            remaining -= count;
+            for format in format_plan(&ranked, count, &quota, produced) {
+                *totals.entry(format).or_default() += 1;
+            }
+            produced += count;
         }
-        // First day: five of each, strongest format first.
-        assert_eq!(&plan[0..5], &["carousel"; 5][..]);
+        assert_eq!(totals["carousel"], 35);
+        assert_eq!(totals["reel"], 7);
+        assert_eq!(totals["story_pack"], 7);
     }
 
     #[test]
@@ -3368,12 +3494,40 @@ mod tests {
     }
 
     #[test]
-    fn fifteen_posts_a_day_get_distinct_times() {
+    fn seven_posts_a_day_keep_the_learned_best_times() {
+        // The measured winners must survive, with extras filling the gaps.
+        let learned = [19u32, 12, 9];
+        let minutes = daily_slot_minutes(7, &learned);
+        assert_eq!(minutes.len(), 7);
+        for hour in learned {
+            assert!(minutes.contains(&(hour * 60)), "best hour {hour}:00 must be kept");
+        }
+        let unique = minutes.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), 7, "no two posts may share a minute");
+        assert!(minutes[0] >= 8 * 60 && *minutes.last().unwrap() <= 21 * 60);
+    }
+
+    #[test]
+    fn many_posts_a_day_get_distinct_times() {
         let minutes = daily_slot_minutes(15, &[]);
         assert_eq!(minutes.len(), 15);
         let unique = minutes.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), 15, "no two posts may share a minute");
         assert!(minutes[0] >= 8 * 60 && *minutes.last().unwrap() <= 21 * 60);
+    }
+
+    #[test]
+    fn every_post_carries_a_north_west_tag() {
+        let c = Connection::open_in_memory().unwrap();
+        migrations(&c).unwrap();
+        // Vision tags with no geography at all.
+        let out = ensure_regional_reach(&c, vec![
+            "#weddingphotography".into(), "#confetti".into(), "#realwedding".into(),
+        ], 0);
+        assert!(out.iter().any(|t| NORTH_WEST_TAGS.contains(&t.as_str())), "got {out:?}");
+        // A set that already names the region is left alone.
+        let already = vec!["#lancashireweddingphotographer".to_string(), "#confetti".to_string()];
+        assert_eq!(ensure_regional_reach(&c, already.clone(), 3), already);
     }
 
     #[test]
@@ -3462,6 +3616,18 @@ mod tests {
 #[cfg(test)]
 mod story_preview {
     use super::*;
+    /// Renders a Reel through the production renderer:
+    /// REEL_OUT=/tmp/r.mp4 REEL_IMAGES=a.jpg,b.jpg cargo test render_reel_preview -- --ignored
+    #[test]
+    #[ignore]
+    fn render_reel_preview() {
+        let (Ok(out), Ok(images)) = (std::env::var("REEL_OUT"), std::env::var("REEL_IMAGES")) else {
+            return;
+        };
+        let paths = images.split(',').map(str::to_string).collect::<Vec<_>>();
+        render_photo_reel(&paths, std::path::Path::new(&out)).unwrap();
+    }
+
     /// Renders one Story to eyeball the overlay:
     /// PREVIEW_DIR=/tmp/x PREVIEW_IMAGE=/path/to.jpg cargo test story_preview -- --ignored
     #[test]

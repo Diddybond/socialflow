@@ -978,12 +978,15 @@ function Autopilot({ data, run, setView }: any) {
       async () => {
         if (!eligible.length) throw Error("No marketing-approved weddings are ready");
         await command("index_visual_duplicates");
-        // Three formats x five a day x seven days.
-        let remaining = 105;
-        for (let index = 0; index < eligible.length && remaining > 0; index++) {
+        // One wedding per day: seven days, seven couples, seven posts each —
+        // five carousels, one Reel and one Story. reflow_wedding_rotation then
+        // keeps each day to a single wedding.
+        const dailyQuota = { carousel: 5, reel: 1, story_pack: 1 };
+        const perDay = 7;
+        const days = Math.min(7, eligible.length);
+        let produced = 0;
+        for (let index = 0; index < days; index++) {
           const wedding = eligible[index];
-          const weddingsLeft = eligible.length - index;
-          const count = Math.ceil(remaining / weddingsLeft);
           const imageIds = data.images
             .filter(
               (image: ImageRecord) =>
@@ -995,13 +998,14 @@ function Autopilot({ data, run, setView }: any) {
           await command("create_content_campaign", {
             profileId: 1,
             imageIds,
-            count,
-            postsPerDay: 15,
+            count: perDay,
+            postsPerDay: perDay,
             weddingId: wedding.id,
             formats: ["carousel", "reel", "story_pack"],
-            perTypePerDay: 5,
+            dailyQuota,
+            formatOffset: produced,
           });
-          remaining -= count;
+          produced += perDay;
         }
       },
       "Seven-day plan prepared for review",
@@ -1017,8 +1021,8 @@ function Autopilot({ data, run, setView }: any) {
     <section className="content autopilot">
       <div className="autopilot-hero">
         <span className="eyebrow">MARKETING AUTOPILOT</span>
-        <h2>Five carousels, five Reels and five Stories a day. One approval session.</h2>
-        <p>SocialFlow chooses the photographs, story mix, formats, captions, hashtags and recommended times. Nothing publishes until you approve it.</p>
+        <h2>One wedding a day. Five carousels, a Reel and a Story. One approval session.</h2>
+        <p>Seven days, seven couples. SocialFlow chooses the photographs, story mix, captions, North West hashtags and the times your audience actually engages. Nothing publishes until you approve it.</p>
         <button className="primary" onClick={buildWeek} disabled={!eligible.length || ready === 0}>
           <Sparkles size={16}/> Prepare the next seven days
         </button>

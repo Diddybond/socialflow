@@ -456,7 +456,16 @@ def image_dimensions(path: Path) -> tuple[int, int]:
         for line in result.stdout.splitlines()
         if ": " in line
     )
-    return int(values.get("pixelWidth", 0)), int(values.get("pixelHeight", 0))
+
+    def measure(key: str) -> int:
+        # sips reports "<nil>" for anything it cannot read as an image — a video,
+        # for instance. Treat that as unknown rather than crashing the publish.
+        try:
+            return int(values.get(key, 0))
+        except ValueError:
+            return 0
+
+    return measure("pixelWidth"), measure("pixelHeight")
 
 
 # Instagram accepts 4:5 (0.80) through 1.91:1. Anything outside is refused with
@@ -606,9 +615,15 @@ def publish_instagram(post_id: int) -> None:
             urls, server, tunnel, page_token, staged = public_urls_for(db, copies)
             media_id = publish_instagram_carousel(account, token, urls, caption)
         elif post_type == "story_pack":
-            # A story pack is a set of frames; Instagram publishes one Story at a
-            # time, so the first frame goes out and the rest stay in the folder.
-            image = instagram_ready_copy(original, Path(temporary.name))
+            # A story pack is a set of rendered 1080x1920 frames carrying the
+            # couple, date, venue and a line of the caption. Publish the first
+            # rendered frame — sending the raw original instead would silently
+            # drop the overlay, since Instagram cannot add text itself.
+            rendered = sorted(Path(row["asset_path"]).glob("story-*.jpg")) if row["asset_path"] else []
+            if rendered:
+                image = rendered[0]
+            else:
+                image = instagram_ready_copy(original, Path(temporary.name))
             urls, server, tunnel, page_token, staged = public_urls_for(db, [image])
             media_id = publish_instagram_story(account, token, urls[0])
         else:
