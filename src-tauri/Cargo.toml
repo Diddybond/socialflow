@@ -27,3 +27,5 @@ dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 keyring = { version = "3", features = ["apple-native"] }
 ureq = { version = "3", features = ["json", "multipart"] }
+ab_glyph = "0.2"
+imageproc = "0.25"

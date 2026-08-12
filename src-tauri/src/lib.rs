@@ -1389,8 +1389,136 @@ fn render_photo_reel(paths: &[String], output: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn export_story_images(paths: &[String], output: &Path) -> Result<(), String> {
+/// Load a system font that `ab_glyph` can parse. Collections (.ttc) are not
+/// parseable, so the candidates are all single-face files.
+fn story_font() -> Option<ab_glyph::FontVec> {
+    for path in [
+        "/System/Library/Fonts/NewYork.ttf",
+        "/System/Library/Fonts/Geneva.ttf",
+        "/System/Library/Fonts/SFNSRounded.ttf",
+        "/System/Library/Fonts/SFNS.ttf",
+        "/Library/Fonts/Arial.ttf",
+    ] {
+        if let Ok(bytes) = fs::read(path) {
+            if let Ok(font) = ab_glyph::FontVec::try_from_vec(bytes) {
+                return Some(font);
+            }
+        }
+    }
+    None
+}
+
+/// Wrap `text` to at most `width` pixels at the given scale.
+fn wrap_text(font: &ab_glyph::FontVec, text: &str, scale: f32, width: f32) -> Vec<String> {
+    use ab_glyph::{Font, ScaleFont};
+    let scaled = font.as_scaled(scale);
+    let measure = |line: &str| -> f32 {
+        line.chars().map(|c| scaled.h_advance(scaled.glyph_id(c))).sum()
+    };
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if current.is_empty() { word.to_string() } else { format!("{current} {word}") };
+        if measure(&candidate) > width && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            current = word.to_string();
+        } else {
+            current = candidate;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn text_width(font: &ab_glyph::FontVec, text: &str, scale: f32) -> f32 {
+    use ab_glyph::{Font, ScaleFont};
+    let scaled = font.as_scaled(scale);
+    text.chars().map(|c| scaled.h_advance(scaled.glyph_id(c))).sum()
+}
+
+/// Overlay the wedding's own details on a finished 1080x1920 Story frame.
+///
+/// Instagram's API cannot add native text or stickers, so anything the viewer
+/// reads has to be part of the image. Everything sits between y=1150 and
+/// y=1650, clear of the profile bar at the top and the reply box at the bottom.
+fn draw_story_text(
+    target: &Path,
+    couple: &str,
+    wedding_date: &str,
+    venue: &str,
+    caption_line: &str,
+    photo_bottom: u32,
+) -> Result<(), String> {
+    let Some(font) = story_font() else { return Ok(()) };
+    let mut canvas = image::open(target).map_err(|e| e.to_string())?.to_rgba8();
+    // The block sits in the blurred band under the photograph, never across it.
+    // Instagram's reply box covers the last ~250px, so the block is pushed up
+    // if it would not otherwise clear it.
+    let block_height = 250u32;
+    let start = photo_bottom
+        .saturating_add(46)
+        .min(1670u32.saturating_sub(block_height))
+        .max(1120);
+    let scrim_from = start.saturating_sub(90).min(1500);
+    for y in scrim_from..1920u32 {
+        let strength = ((y - scrim_from) as f32 / (1920 - scrim_from) as f32).powf(1.4) * 0.82;
+        for x in 0..1080u32 {
+            let pixel = canvas.get_pixel_mut(x, y);
+            for channel in 0..3 {
+                pixel[channel] = (pixel[channel] as f32 * (1.0 - strength)) as u8;
+            }
+        }
+    }
+    let white = image::Rgba([255u8, 255, 255, 255]);
+    let muted = image::Rgba([228u8, 226, 222, 255]);
+    let mut y = start as i32;
+    // A line of the photographer's own caption, at most two lines.
+    let hook = caption_line.trim();
+    if !hook.is_empty() {
+        for line in wrap_text(&font, hook, 44.0, 940.0).into_iter().take(2) {
+            let x = ((1080.0 - text_width(&font, &line, 44.0)) / 2.0) as i32;
+            imageproc::drawing::draw_text_mut(&mut canvas, muted, x, y, 44.0, &font, &line);
+            y += 58;
+        }
+        y += 34;
+    }
+    let headline = if wedding_date.trim().is_empty() {
+        couple.to_string()
+    } else {
+        format!("{couple}  ·  {}", pretty_date(wedding_date))
+    };
+    let x = ((1080.0 - text_width(&font, &headline, 58.0)) / 2.0) as i32;
+    imageproc::drawing::draw_text_mut(&mut canvas, white, x, y, 58.0, &font, &headline);
+    y += 76;
+    if !venue.trim().is_empty() {
+        let x = ((1080.0 - text_width(&font, venue, 38.0)) / 2.0) as i32;
+        imageproc::drawing::draw_text_mut(&mut canvas, muted, x, y, 38.0, &font, venue);
+    }
+    image::DynamicImage::ImageRgba8(canvas)
+        .to_rgb8()
+        .save_with_format(target, image::ImageFormat::Jpeg)
+        .map_err(|e| e.to_string())
+}
+
+/// "2026-05-30" -> "30 May 2026"; anything unparseable is passed through.
+fn pretty_date(raw: &str) -> String {
+    NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+        .map(|date| date.format("%-d %B %Y").to_string())
+        .unwrap_or_else(|_| raw.trim().to_string())
+}
+
+fn export_story_images(
+    paths: &[String],
+    output: &Path,
+    couple: &str,
+    wedding_date: &str,
+    venue: &str,
+    caption: &str,
+) -> Result<(), String> {
     fs::create_dir_all(output).map_err(|e| e.to_string())?;
+    let hook = caption.lines().find(|line| !line.trim().is_empty()).unwrap_or("");
     let ffmpeg = ffmpeg_binary().ok();
     for (index, source) in paths.iter().enumerate() {
         let target = output.join(format!("story-{:02}.jpg", index + 1));
@@ -1409,6 +1537,7 @@ fn export_story_images(paths: &[String], output: &Path) -> Result<(), String> {
                 .output()
                 .map_err(|e| e.to_string())?;
             if result.status.success() && target.exists() {
+                draw_story_text(&target, couple, wedding_date, venue, hook, photo_bottom(source))?;
                 continue;
             }
         }
@@ -1428,8 +1557,20 @@ fn export_story_images(paths: &[String], output: &Path) -> Result<(), String> {
         image::DynamicImage::ImageRgb8(canvas)
             .save_with_format(&target, image::ImageFormat::Jpeg)
             .map_err(|e| e.to_string())?;
+        draw_story_text(&target, couple, wedding_date, venue, hook, photo_bottom(source))?;
     }
     Ok(())
+}
+
+/// Lower edge, in the 1080x1920 frame, of a photograph scaled to fit whole.
+fn photo_bottom(source: &str) -> u32 {
+    let fitted = image::image_dimensions(source)
+        .map(|(width, height)| {
+            let scale = (1080.0 / width as f32).min(1920.0 / height as f32);
+            (height as f32 * scale).round() as u32
+        })
+        .unwrap_or(1920);
+    (1920 + fitted.min(1920)) / 2
 }
 
 #[tauri::command]
@@ -1566,7 +1707,10 @@ fn create_content_campaign(
                 .cache
                 .join("story-packs")
                 .join(format!("{}-{post_id}", couple.replace([' ', '&'], "-")));
-            export_story_images(&paths, &path)?;
+            let wedding_date = tx
+                .query_row("SELECT wedding_date FROM weddings WHERE id=?", [wedding_id], |r| r.get::<_, String>(0))
+                .unwrap_or_default();
+            export_story_images(&paths, &path, &couple, &wedding_date, &venue, &caption)?;
             Some(path.to_string_lossy().to_string())
         } else {
             None
@@ -3312,5 +3456,29 @@ mod tests {
         assert!(c
             .execute("INSERT INTO posts(profile_id,status)VALUES(1,'bogus')", [])
             .is_err())
+    }
+}
+
+#[cfg(test)]
+mod story_preview {
+    use super::*;
+    /// Renders one Story to eyeball the overlay:
+    /// PREVIEW_DIR=/tmp/x PREVIEW_IMAGE=/path/to.jpg cargo test story_preview -- --ignored
+    #[test]
+    #[ignore]
+    fn render_preview() {
+        let (Ok(dir), Ok(src)) = (std::env::var("PREVIEW_DIR"), std::env::var("PREVIEW_IMAGE")) else {
+            return;
+        };
+        let out = std::path::PathBuf::from(dir);
+        export_story_images(
+            &[src],
+            &out,
+            "Aimee & Kent",
+            "2026-05-30",
+            "Langshaw Head Farm",
+            "Kent has acquired two light sticks and Aimee knows exactly where this is heading.\nOne huge reaction.",
+        )
+        .unwrap();
     }
 }
