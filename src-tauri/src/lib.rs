@@ -1340,7 +1340,18 @@ fn render_photo_reel(paths: &[String], output: &Path) -> Result<(), String> {
     }
     let mut filters = Vec::new();
     for index in 0..paths.len() {
-        filters.push(format!("[{index}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(zoom+0.0009,1.08)':d=1:s=1080x1920:fps=30,fade=t=in:st=0:d=0.22,fade=t=out:st=1.58:d=0.22,setsar=1[v{index}]"));
+        // The whole photograph is shown, never cropped: it is scaled to fit
+        // inside the 9:16 Reel frame, and the space above and below is filled
+        // with a heavily blurred enlargement of the same photograph. Cropping
+        // to 1080x1920 threw away about half of every landscape frame.
+        // The blur is done at low resolution and scaled back up, which looks
+        // identical to a full-size gaussian and renders far faster.
+        filters.push(format!(
+            "[{index}:v]split=2[bg{index}][fg{index}];\
+             [bg{index}]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,scale=108:192,gblur=sigma=6,scale=1080:1920,eq=brightness=-0.06[bb{index}];\
+             [fg{index}]scale=1080:1920:force_original_aspect_ratio=decrease[fg2{index}];\
+             [bb{index}][fg2{index}]overlay=(W-w)/2:(H-h)/2,zoompan=z='min(zoom+0.0009,1.08)':d=1:s=1080x1920:fps=30,fade=t=in:st=0:d=0.22,fade=t=out:st=1.58:d=0.22,setsar=1[v{index}]"
+        ));
     }
     let inputs = (0..paths.len())
         .map(|index| format!("[v{index}]"))
@@ -1380,15 +1391,42 @@ fn render_photo_reel(paths: &[String], output: &Path) -> Result<(), String> {
 
 fn export_story_images(paths: &[String], output: &Path) -> Result<(), String> {
     fs::create_dir_all(output).map_err(|e| e.to_string())?;
+    let ffmpeg = ffmpeg_binary().ok();
     for (index, source) in paths.iter().enumerate() {
+        let target = output.join(format!("story-{:02}.jpg", index + 1));
+        // Same treatment as a Reel: the whole photograph, never cropped, over a
+        // blurred enlargement of itself. resize_to_fill cut roughly half off
+        // every landscape frame.
+        if let Some(binary) = ffmpeg.as_ref() {
+            let result = Command::new(binary)
+                .args(["-y", "-hide_banner", "-loglevel", "error", "-i", source, "-filter_complex",
+                    "[0:v]split=2[bg][fg];\
+                     [bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,scale=108:192,gblur=sigma=6,scale=1080:1920,eq=brightness=-0.06[bb];\
+                     [fg]scale=1080:1920:force_original_aspect_ratio=decrease[fg2];\
+                     [bb][fg2]overlay=(W-w)/2:(H-h)/2[out]",
+                    "-map", "[out]", "-frames:v", "1", "-q:v", "2"])
+                .arg(&target)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if result.status.success() && target.exists() {
+                continue;
+            }
+        }
+        // Without FFmpeg, fall back to fitting the frame on a neutral canvas —
+        // still uncropped, just without the blurred surround.
         let image =
             image::open(source).map_err(|e| format!("Could not open story photograph: {e}"))?;
-        let resized = image.resize_to_fill(1080, 1920, image::imageops::FilterType::Lanczos3);
-        resized
-            .save_with_format(
-                output.join(format!("story-{:02}.jpg", index + 1)),
-                image::ImageFormat::Jpeg,
-            )
+        let fitted = image.resize(1080, 1920, image::imageops::FilterType::Lanczos3);
+        let mut canvas = image::RgbImage::from_pixel(1080, 1920, image::Rgb([18, 18, 18]));
+        let (width, height) = fitted.dimensions();
+        image::imageops::overlay(
+            &mut canvas,
+            &fitted.to_rgb8(),
+            ((1080 - width) / 2) as i64,
+            ((1920 - height) / 2) as i64,
+        );
+        image::DynamicImage::ImageRgb8(canvas)
+            .save_with_format(&target, image::ImageFormat::Jpeg)
             .map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -3070,6 +3108,16 @@ mod tests {
         )
         .unwrap();
         assert!(fs::metadata(&output).unwrap().len() > 1_000);
+        // The Reel frame must be 9:16, and the landscape source must survive
+        // whole inside it rather than being cropped to fill.
+        if let Ok(probe) = Command::new("/usr/local/bin/ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries",
+                   "stream=width,height", "-of", "csv=p=0", output.to_string_lossy().as_ref()])
+            .output()
+        {
+            let dims = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+            assert_eq!(dims, "1080,1920", "Reel canvas must stay 9:16");
+        }
         let _ = fs::remove_dir_all(dir);
     }
     #[test]
