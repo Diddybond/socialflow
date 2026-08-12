@@ -3677,6 +3677,113 @@ pub fn review_last_week() -> Result<(), String> {
     Ok(())
 }
 
+/// Ask the model which weddings should carry the week.
+///
+/// Recency alone ignores venue variety, season, which couples' content has
+/// actually performed, and which weddings have been leaned on lately.
+fn ai_select_weddings(c: &Connection, wanted: usize) -> Option<Vec<i64>> {
+    let mut catalogue = String::new();
+    let mut eligible = Vec::new();
+    if let Ok(mut statement) = c.prepare(
+        "SELECT w.id,w.couple_names,w.venue,w.region,w.wedding_date,         (SELECT COUNT(*) FROM images i JOIN image_analysis a ON a.image_id=i.id WHERE i.collection_id=w.collection_id AND a.provider IN ('claude','openai') AND NOT EXISTS(SELECT 1 FROM post_images pi WHERE pi.image_id=i.id)) unused,         (SELECT COUNT(*) FROM posts p JOIN post_images pi ON pi.post_id=p.id JOIN images i ON i.id=pi.image_id WHERE i.collection_id=w.collection_id AND p.status='published') published,         (SELECT ROUND(AVG(ip.reach)) FROM instagram_performance ip JOIN posts p ON p.id=ip.local_post_id JOIN post_images pi ON pi.post_id=p.id JOIN images i ON i.id=pi.image_id WHERE i.collection_id=w.collection_id) avg_reach         FROM weddings w WHERE w.collection_id IS NOT NULL AND w.consent_level NOT IN ('none','portfolio_only') AND (w.embargo_until IS NULL OR w.embargo_until<=date('now'))")
+    {
+        if let Ok(rows) = statement.query_map([], |r| {
+            let id: i64 = r.get(0)?;
+            Ok((id, format!(
+                "  id {} | {} | {} | {} | {} | {} unused photographs | {} already published | avg reach {}\n",
+                id, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?,
+                r.get::<_, Option<f64>>(7)?.map(|v| v.to_string()).unwrap_or_else(|| "not measured".into()))))
+        }) {
+            for (id, line) in rows.filter_map(Result::ok) {
+                eligible.push(id);
+                catalogue.push_str(&line);
+            }
+        }
+    }
+    if eligible.len() <= wanted {
+        return None;
+    }
+    let executable = command_path("claude")?;
+    let model = c
+        .query_row("SELECT value FROM app_settings WHERE key='claude_model_strategy'", [], |r| r.get::<_, String>(0))
+        .unwrap_or_else(|_| "opus".into());
+    let month = Local::now().format("%B").to_string();
+    let prompt = format!(
+        "Choose which {wanted} weddings a North West England documentary wedding photographer should feature over the next seven days, one couple per day.\n\nIt is {month}. The audience is UK couples planning weddings in Lancashire, Cheshire, Greater Manchester, Merseyside and the Lake District — they are choosing a photographer, and a venue they recognise or are considering matters.\n\nWeigh: variety of venue and setting across the week, whether a wedding has been leaned on recently, how much unused material each has, seasonal fit with {month}, and measured reach where it exists. Do not simply take the most recent.\n\nCandidates:\n{catalogue}\nReturn the chosen wedding ids in the order they should run, strongest first, and one sentence of reasoning."
+    );
+    let schema = r#"{"type":"object","additionalProperties":false,"properties":{"wedding_ids":{"type":"array","minItems":1,"maxItems":14,"items":{"type":"integer"}},"reasoning":{"type":"string"}},"required":["wedding_ids","reasoning"]}"#;
+    let mut command = Command::new(executable);
+    command.arg("--model").arg(model);
+    command.args(["--print", "--output-format", "json", "--json-schema", schema,
+                  "--permission-mode", "dontAsk", "--no-session-persistence"]);
+    let (success, stdout, _) = run_with_input(&mut command, &prompt, StdDuration::from_secs(180)).ok()?;
+    if !success {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&stdout);
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let payload = value.get("structured_output").cloned()
+        .or_else(|| value.get("result").and_then(|r| r.as_str()).and_then(|r| serde_json::from_str(r.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim()).ok()))
+        .unwrap_or(value);
+    let chosen = payload.get("wedding_ids")?.as_array()?.iter().filter_map(|v| v.as_i64()).collect::<Vec<_>>();
+    if let Some(reason) = payload.get("reasoning").and_then(|r| r.as_str()) {
+        println!("wedding choice: {reason}");
+    }
+    // Only ids that were actually offered, deduplicated.
+    let allowed = eligible.into_iter().collect::<std::collections::HashSet<_>>();
+    let mut seen = std::collections::HashSet::new();
+    let valid = chosen.into_iter().filter(|id| allowed.contains(id) && seen.insert(*id)).take(wanted).collect::<Vec<_>>();
+    (valid.len() == wanted).then_some(valid)
+}
+
+/// A weekly look at the whole system, in plain words.
+pub fn health_check() -> Result<(), String> {
+    let (c, _) = headless_db()?;
+    let mut facts = String::new();
+    let rows: [(&str, &str); 8] = [
+        ("posts scheduled ahead", "SELECT COUNT(*) FROM posts WHERE status='scheduled' AND scheduled_at>=datetime('now','localtime')"),
+        ("posts published in the last 7 days", "SELECT COUNT(*) FROM posts WHERE status='published' AND published_at>=datetime('now','-7 days')"),
+        ("posts failed in the last 7 days", "SELECT COUNT(*) FROM posts WHERE status='failed'"),
+        ("posts awaiting a human", "SELECT COUNT(*) FROM publish_recovery WHERE requires_action=1"),
+        ("photographs indexed", "SELECT COUNT(*) FROM images"),
+        ("photographs whose original is missing", "SELECT COUNT(*) FROM images WHERE missing=1"),
+        ("photographs never analysed", "SELECT COUNT(*) FROM images i WHERE NOT EXISTS(SELECT 1 FROM image_analysis a WHERE a.image_id=i.id AND a.provider IN ('claude','openai'))"),
+        ("measured posts the brain learns from", "SELECT COUNT(*) FROM instagram_performance"),
+    ];
+    for (label, query) in rows {
+        let value: i64 = c.query_row(query, [], |r| r.get(0)).unwrap_or(-1);
+        facts.push_str(&format!("  {label}: {value}\n"));
+    }
+    for key in ["last_backup_at", "insights_permission", "require_approval", "ai_strategy_at"] {
+        let value: String = c.query_row("SELECT value FROM app_settings WHERE key=?", [key], |r| r.get(0)).unwrap_or_else(|_| "unset".into());
+        facts.push_str(&format!("  {key}: {value}\n"));
+    }
+    let expiry: String = c.query_row("SELECT COALESCE(token_expiry,'unknown') FROM instagram_accounts WHERE connected=1 LIMIT 1", [], |r| r.get(0)).unwrap_or_else(|_| "not connected".into());
+    facts.push_str(&format!("  instagram token expires: {expiry}\n"));
+    let last_sync: String = c.query_row("SELECT COALESCE(MAX(synced_at),'never') FROM instagram_performance", [], |r| r.get(0)).unwrap_or_else(|_| "never".into());
+    facts.push_str(&format!("  results last synced: {last_sync}\n"));
+    println!("{facts}");
+    let Some(executable) = command_path("claude") else {
+        return Ok(());
+    };
+    let model = c.query_row("SELECT value FROM app_settings WHERE key='claude_model_diagnosis'", [], |r| r.get::<_, String>(0)).unwrap_or_else(|_| "opus".into());
+    let prompt = format!(
+        "You look after an automated social media system for a wedding photographer. Here is its state today:\n\n{facts}\nToday is {}. Say in three sentences whether this is healthy, and name the single most important thing that needs attention, or say plainly that nothing does. Be specific about numbers. Do not invent problems to sound useful.",
+        Local::now().format("%A %-d %B %Y")
+    );
+    let mut command = Command::new(executable);
+    command.arg("--model").arg(model);
+    command.args(["--print", "--permission-mode", "dontAsk", "--no-session-persistence"]);
+    if let Ok((true, stdout, _)) = run_with_input(&mut command, &prompt, StdDuration::from_secs(120)) {
+        let verdict = String::from_utf8_lossy(&stdout).trim().to_string();
+        println!("{verdict}");
+        let _ = c.execute("INSERT INTO app_settings(key,value)VALUES('ai_health',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [verdict]);
+        let _ = c.execute("INSERT INTO app_settings(key,value)VALUES('ai_health_at',strftime('%Y-%m-%d %H:%M','now','localtime')) ON CONFLICT(key) DO UPDATE SET value=excluded.value", []);
+    }
+    Ok(())
+}
+
 /// Curate one wedding and print the result, without writing anything.
 pub fn try_curate(wedding_id: i64) -> Result<(), String> {
     let (c, _) = headless_db()?;
@@ -3750,8 +3857,18 @@ pub fn prepare_week_headless() -> Result<(), String> {
         println!("{pending} posts are already queued; nothing to prepare");
         return Ok(());
     }
+    let chosen = ai_select_weddings(&c, 7);
+    if chosen.is_none() {
+        println!("wedding choice: most recent seven (Claude unavailable or too few candidates)");
+    }
+    let order_clause = match &chosen {
+        Some(ids) => format!("SELECT id,collection_id FROM weddings WHERE id IN ({}) ORDER BY CASE id {} END",
+            ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","),
+            ids.iter().enumerate().map(|(rank, id)| format!("WHEN {id} THEN {rank}")).collect::<Vec<_>>().join(" ")),
+        None => "SELECT id,collection_id FROM weddings WHERE collection_id IS NOT NULL AND consent_level NOT IN ('none','portfolio_only') AND (embargo_until IS NULL OR embargo_until<=date('now')) ORDER BY wedding_date DESC,created_at DESC LIMIT 7".to_string(),
+    };
     let weddings = c
-        .prepare("SELECT id,collection_id FROM weddings WHERE collection_id IS NOT NULL AND consent_level NOT IN ('none','portfolio_only') AND (embargo_until IS NULL OR embargo_until<=date('now')) ORDER BY wedding_date DESC,created_at DESC LIMIT 7")
+        .prepare(&order_clause)
         .map_err(|e| e.to_string())?
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
         .map_err(|e| e.to_string())?

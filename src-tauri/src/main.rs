@@ -4,6 +4,8 @@ fn main() {
     // Headless entry points, so the scheduled agents never need a window.
     let outcome = if has("--sync-insights") {
         Some(socialflow_lib::sync_insights_headless())
+    } else if has("--health") {
+        Some(socialflow_lib::health_check())
     } else if has("--review") {
         Some(socialflow_lib::review_last_week())
     } else if has("--prepare-week") {

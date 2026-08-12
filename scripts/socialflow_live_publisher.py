@@ -95,9 +95,53 @@ DIAGNOSIS_SCHEMA = json.dumps({
         "retry_in_seconds": {"type": "integer", "minimum": 0, "maximum": 86400},
         "diagnosis": {"type": "string"},
         "resolution_hint": {"type": "string"},
+        "remedy": {"type": "string", "enum": ["none", "drop_photograph", "shrink_set", "recrop"]},
+        "remedy_position": {"type": "integer", "minimum": 0, "maximum": 13},
     },
-    "required": ["failure_class", "retryable", "retry_in_seconds", "diagnosis", "resolution_hint"],
+    "required": ["failure_class", "retryable", "retry_in_seconds", "diagnosis", "resolution_hint", "remedy"],
 })
+
+
+def apply_remedy(post_id: int, remedy: str, position: int) -> str | None:
+    """Carry out the model's suggested fix so the post can go out on its own.
+
+    Deliberately conservative: it removes or trims photographs and never
+    rewrites a caption. The photograph stays in the library — only its place in
+    this post changes.
+    """
+    if remedy in (None, "none"):
+        return None
+    db = sqlite3.connect(DB)
+    try:
+        images = db.execute(
+            "SELECT image_id,position FROM post_images WHERE post_id=? ORDER BY position", (post_id,)
+        ).fetchall()
+        if not images:
+            return None
+        if remedy == "drop_photograph" and len(images) > 1:
+            target = images[min(position, len(images) - 1)][0]
+            db.execute("DELETE FROM post_images WHERE post_id=? AND image_id=?", (post_id, target))
+            note = f"removed photograph {target} and retried"
+        elif remedy == "shrink_set" and len(images) > 3:
+            keep = images[: max(3, len(images) // 2)]
+            db.execute("DELETE FROM post_images WHERE post_id=? AND image_id NOT IN (%s)"
+                       % ",".join(str(i[0]) for i in keep), (post_id,))
+            note = f"trimmed the set from {len(images)} to {len(keep)} photographs and retried"
+        elif remedy == "recrop":
+            # aspect_safe_copy re-crops on every publish, so a retry is the fix.
+            note = "re-cropped the photograph to Instagram's accepted range and retried"
+        else:
+            return None
+        # Renumber so positions stay contiguous.
+        remaining = db.execute("SELECT image_id FROM post_images WHERE post_id=? ORDER BY position", (post_id,)).fetchall()
+        for index, (image_id,) in enumerate(remaining):
+            db.execute("UPDATE post_images SET position=? WHERE post_id=? AND image_id=?", (index, post_id, image_id))
+        db.commit()
+        return note
+    except sqlite3.Error:
+        return None
+    finally:
+        db.close()
 
 
 def ai_diagnose(post_id: int, error: Exception) -> dict | None:
@@ -131,7 +175,11 @@ def ai_diagnose(post_id: int, error: Exception) -> dict | None:
         "A permanent rejection — an unsupported format, a policy refusal, a revoked token, a missing file — "
         "must NOT be marked retryable, however transient the wording looks. "
         "Rate limits are retryable but need a long wait. "
-        "Write resolution_hint as one plain sentence for a photographer, naming what to do next."
+        "Write resolution_hint as one plain sentence for a photographer, naming what to do next.\n"
+        "If the post can be repaired automatically, set remedy: drop_photograph (with remedy_position, "
+        "the zero-based index of the offending photograph) when one specific image is refused; shrink_set "
+        "when the set is too large; recrop when the dimensions or aspect ratio are the problem. "
+        "Use remedy 'none' when nothing safe can be done without a person — never guess."
     )
     try:
         result = subprocess.run(
@@ -157,11 +205,19 @@ def schedule_recovery(post_id: int, error: Exception) -> None:
     db = sqlite3.connect(DB)
     ensure_recovery_schema(db)
     diagnosis = ai_diagnose(post_id, error)
+    remedy_note = None
     if diagnosis:
         failure_class = diagnosis["failure_class"]
         retryable = bool(diagnosis["retryable"])
         hint = diagnosis["resolution_hint"]
         ai_wait = int(diagnosis.get("retry_in_seconds") or 0)
+        # Fix it rather than waiting for a human, where the fix is safe.
+        remedy_note = apply_remedy(post_id, diagnosis.get("remedy", "none"), int(diagnosis.get("remedy_position") or 0))
+        if remedy_note:
+            retryable = True
+            ai_wait = min(ai_wait or 120, 600)
+            hint = f"SocialFlow {remedy_note}. {hint}"
+            print(f"post {post_id}: {remedy_note}", flush=True)
     else:
         failure_class, retryable, hint = classify_failure(error)
         ai_wait = 0
