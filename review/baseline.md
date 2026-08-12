@@ -130,6 +130,15 @@ mode is permissive. The term list is also thin: it misses "kids", "children",
   Tauri v2. Dead code.
 - **W7.** Migration v3 force-sets `allow_cloud_ai='true'`, overriding a user who
   had turned it off.
+- **W8.** *(found mid-round, 12 Aug)* Facebook silently truncates multi-photo
+  posts. `publish_facebook` joins `post_images` on `position=0` and sends that
+  one photograph to `/photos` whatever the post type. Post 88 published on
+  12 Aug at 07:00 as a "carousel" of **7 photographs — one of which went out**.
+  Live history: Facebook has published 3 carousels, 1 Reel and 4 singles, all
+  reported as successes. A Reel published to Facebook is a still photograph.
+  This is why Facebook must stay publishable for every type: blocking it would
+  remove behaviour that works. The truncation is the real defect and is not
+  fixed in round 1.
 
 ## ABSENT
 

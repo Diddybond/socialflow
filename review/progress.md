@@ -34,6 +34,24 @@ Round 1. Branch `fix/publishing-truthfulness`. Baseline: `review/baseline.md`.
 | B4 | Prefix match links a caption with appended hashtags; equality match still links nothing. |
 | B5 | Unanalysed photograph withheld, adults-only photograph still passes. |
 
+## Regression introduced and fixed within round 1
+
+The first cut of `publishable()` treated Facebook like Instagram — single
+photographs only. Live publish history says otherwise: Facebook has successfully
+published 3 carousels, 1 Reel and 4 singles, because `publish_facebook` sends
+the post's first photograph whatever the type. The fix would have blocked all
+Facebook multi-photo posting, which is working behaviour and therefore an
+automatic fail.
+
+Corrected: Facebook is publishable for every type. The predicate now matches
+observed reality exactly — every combination that has ever published is allowed,
+every combination that has ever failed is blocked. The underlying truncation is
+recorded as W8 and is not fixed.
+
+This was caught by live evidence, not by a critic. It is precisely the kind of
+thing the behaviour critic exists to catch, and it got through because that
+critic never ran.
+
 ## Found by self-review, fixed in round 1
 
 - `PUBLISHABLE_SQL` evaluated to SQL NULL for a NULL `post_type`, so `NOT

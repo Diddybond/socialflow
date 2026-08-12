@@ -698,7 +698,7 @@ fn learned_posting_hours(c: &Connection, count: usize) -> Vec<u32> {
 /// Both columns are COALESCEd so the predicate is total: with a NULL
 /// `post_type` SQLite would otherwise yield NULL, and `NOT NULL` is NULL, so a
 /// row could be neither publishable nor stood down.
-const PUBLISHABLE_SQL: &str = "((COALESCE(platform,'instagram') IN ('instagram','facebook') AND COALESCE(post_type,'single')='single') OR (COALESCE(platform,'instagram')='tiktok' AND COALESCE(post_type,'single')='reel'))";
+const PUBLISHABLE_SQL: &str = "((COALESCE(platform,'instagram')='instagram' AND COALESCE(post_type,'single')='single') OR COALESCE(platform,'instagram')='facebook' OR (COALESCE(platform,'instagram')='tiktok' AND COALESCE(post_type,'single')='reel'))";
 
 /// Whether SocialFlow can actually publish this combination today.
 ///
@@ -709,8 +709,14 @@ const PUBLISHABLE_SQL: &str = "((COALESCE(platform,'instagram') IN ('instagram',
 /// scheduled day after burning eight retries.
 fn publishable(platform: &str, post_type: &str) -> bool {
     match platform {
-        // Meta's single-photo endpoints are all the publisher implements.
-        "instagram" | "facebook" => post_type == "single",
+        // Instagram's container API is only implemented for one photograph.
+        "instagram" => post_type == "single",
+        // Facebook's /photos endpoint accepts anything: the publisher sends the
+        // first photograph of the post whatever its type. Live history confirms
+        // carousels, Reels and singles have all published to the Page. It is
+        // lossy — a seven-photograph carousel goes out as one photograph — but
+        // it succeeds, so refusing it here would remove working behaviour.
+        "facebook" => true,
         // TikTok publishes the rendered vertical video and nothing else.
         "tiktok" => post_type == "reel",
         _ => false,
@@ -2876,12 +2882,16 @@ mod tests {
     fn only_shippable_formats_are_publishable() {
         // B1: the combinations the publisher actually implements.
         assert!(publishable("instagram", "single"));
-        assert!(publishable("facebook", "single"));
         assert!(publishable("tiktok", "reel"));
         for format in ["carousel", "reel", "story_pack"] {
             assert!(!publishable("instagram", format), "{format} cannot be sent to Instagram");
         }
         assert!(!publishable("tiktok", "single"));
+        // Live history: Facebook has published carousels, Reels and singles.
+        // Blocking any of them would be a regression, however lossy the result.
+        for format in ["single", "carousel", "reel", "story_pack"] {
+            assert!(publishable("facebook", format), "Facebook publishes {format} today");
+        }
     }
 
     #[test]
