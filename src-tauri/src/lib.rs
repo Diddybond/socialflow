@@ -1420,7 +1420,7 @@ fn ffmpeg_binary() -> Result<PathBuf, String> {
     .ok_or_else(|| "Reel rendering needs FFmpeg. Install it with: brew install ffmpeg".into())
 }
 
-fn render_photo_reel(paths: &[String], output: &Path) -> Result<(), String> {
+fn render_photo_reel(paths: &[String], output: &Path, seconds: f64) -> Result<(), String> {
     if paths.len() < 2 {
         return Err("A Reel needs at least two photographs".into());
     }
@@ -1430,8 +1430,9 @@ fn render_photo_reel(paths: &[String], output: &Path) -> Result<(), String> {
     let mut command = Command::new(ffmpeg_binary()?);
     command.args(["-y", "-hide_banner", "-loglevel", "error"]);
     for path in paths {
-        command.args(["-loop", "1", "-t", "1.8", "-i", path]);
+        command.args(["-loop", "1", "-t", &format!("{seconds:.2}"), "-i", path]);
     }
+    let fade_out = (seconds - 0.22).max(0.3);
     let mut filters = Vec::new();
     for index in 0..paths.len() {
         // The whole photograph is shown, never cropped: it is scaled to fit
@@ -1444,7 +1445,7 @@ fn render_photo_reel(paths: &[String], output: &Path) -> Result<(), String> {
             "[{index}:v]split=2[bg{index}][fg{index}];\
              [bg{index}]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,scale=108:192,gblur=sigma=6,scale=1080:1920,eq=brightness=-0.06[bb{index}];\
              [fg{index}]scale=1080:1920:force_original_aspect_ratio=decrease[fg2{index}];\
-             [bb{index}][fg2{index}]overlay=(W-w)/2:(H-h)/2,zoompan=z='min(zoom+0.0009,1.08)':d=1:s=1080x1920:fps=30,fade=t=in:st=0:d=0.22,fade=t=out:st=1.58:d=0.22,setsar=1[v{index}]"
+             [bb{index}][fg2{index}]overlay=(W-w)/2:(H-h)/2,zoompan=z='min(zoom+0.0009,1.08)':d=1:s=1080x1920:fps=30,fade=t=in:st=0:d=0.22,fade=t=out:st={fade_out:.2}:d=0.22,setsar=1[v{index}]"
         ));
     }
     let inputs = (0..paths.len())
@@ -1720,6 +1721,9 @@ fn build_content_campaign(
             },
         )
         .map_err(|e| e.to_string())?;
+    let wedding_date_for_curation = tx
+        .query_row("SELECT wedding_date FROM weddings WHERE id=?", [wedding_id], |r| r.get::<_, String>(0))
+        .unwrap_or_default();
     let mut ids = marketing_safe_images(&tx, wedding_id, image_ids)?;
     ids.retain(|id| {
         !tx.query_row(
@@ -1753,39 +1757,65 @@ fn build_content_campaign(
     } else {
         daily_cycle_length(&ranked, &quota) as u32
     };
+    // The model curates the day; the heuristic plan stands in if it cannot.
+    let curated = ai_curate(&tx, wedding_id, &couple, &venue, &wedding_date_for_curation, &ids, &quota);
+    match &curated {
+        Some(posts) => println!("curated {} posts for {couple} with Claude", posts.len()),
+        None => println!("curating {couple} by measured ranking (Claude unavailable or answer rejected)"),
+    }
+    let steps = curated.as_ref().map(|posts| posts.len()).unwrap_or(count);
     let mut cursor = 0usize;
-    for index in 0..count {
-        if cursor >= ids.len() {
-            break;
-        }
-        let format = plan[index].as_str();
-        let wanted = match format {
-            "carousel" => 7,
-            "reel" => 12,
-            "story_pack" => 5,
-            _ => 1,
+    for index in 0..steps {
+        let curated_post = curated.as_ref().and_then(|posts| posts.get(index)).cloned();
+        let format_owned = curated_post
+            .as_ref()
+            .map(|post| post.format.clone())
+            .unwrap_or_else(|| plan[index].clone());
+        let format = format_owned.as_str();
+        let chosen = match &curated_post {
+            Some(post) => post.image_ids.clone(),
+            None => {
+                if cursor >= ids.len() {
+                    break;
+                }
+                let wanted = match format {
+                    "carousel" => 7,
+                    "reel" => 12,
+                    "story_pack" => 5,
+                    _ => 1,
+                };
+                let picked = ids[cursor..ids.len().min(cursor + wanted)].to_vec();
+                cursor += picked.len();
+                picked
+            }
         };
-        let chosen = ids[cursor..ids.len().min(cursor + wanted)].to_vec();
-        if chosen.is_empty() {
+        if chosen.is_empty() || (format == "reel" && chosen.len() < 2) {
             break;
         }
-        if format == "reel" && chosen.len() < 2 {
-            break;
-        }
-        cursor += chosen.len();
+        let pace = curated_post
+            .as_ref()
+            .and_then(|post| post.seconds_per_photo)
+            .unwrap_or(1.8)
+            .clamp(0.8, 4.0);
         let category = tx.query_row("SELECT COALESCE(sub_category,'wedding story') FROM image_analysis WHERE image_id=?", [chosen[0]], |r| r.get::<_, String>(0)).unwrap_or_else(|_| "wedding story".into());
         let visual = tx.query_row("SELECT analysis_json FROM image_analysis WHERE image_id=? AND provider IN ('claude','openai')", [chosen[0]], |r| r.get::<_, String>(0)).ok().and_then(|json| serde_json::from_str::<VisualAnalysis>(&json).ok());
-        let mut caption = visual
+        let mut caption = curated_post
             .as_ref()
-            .map(|analysis| analysis.caption.clone())
+            .map(|post| post.caption.clone())
+            .or_else(|| visual.as_ref().map(|analysis| analysis.caption.clone()))
             .unwrap_or_else(|| brand_caption(&couple, &venue, &category, index));
-        if caption_too_similar(&tx, &caption) {
+        if caption_too_similar(&tx, &caption) && curated_post.is_none() {
             caption = brand_caption(&couple, &venue, &category, index + 3);
         }
-        let tag_list = visual
-            .map(|analysis| analysis.hashtags)
+        let tag_list = curated_post
+            .as_ref()
+            .map(|post| post.hashtags.clone())
+            .or_else(|| visual.map(|analysis| analysis.hashtags))
             .unwrap_or_else(|| wedding_hashtags(&venue, &category, index));
-        add_supplier_context(&tx, Some(wedding_id), &mut caption, index);
+        // The model is asked to weave credits in; only bolt one on when it did not.
+        if curated_post.is_none() {
+            add_supplier_context(&tx, Some(wedding_id), &mut caption, index);
+        }
         let tag_list = ensure_regional_reach(&tx, tag_list, index);
         let tags = serde_json::to_string(&diversify_hashtags(&tx, tag_list)).unwrap();
         let learned_hours = learned_posting_hours(&tx, posts_per_day.clamp(1, 5) as usize);
@@ -1822,7 +1852,7 @@ fn build_content_campaign(
             let path = cache
                 .join("reels")
                 .join(format!("reel-{post_id}.mp4"));
-            render_photo_reel(&paths, &path)?;
+            render_photo_reel(&paths, &path, pace)?;
             Some(path.to_string_lossy().to_string())
         } else if format == "story_pack" {
             let path = cache
@@ -2128,6 +2158,144 @@ fn daily_cycle_length(ranked: &[String], quota: &HashMap<String, u32>) -> usize 
         .map(|format| quota.get(format).copied().unwrap_or(0))
         .sum();
     total.max(1) as usize
+}
+
+#[derive(Deserialize, Clone)]
+struct CuratedPost {
+    format: String,
+    image_ids: Vec<i64>,
+    caption: String,
+    hashtags: Vec<String>,
+    seconds_per_photo: Option<f64>,
+}
+#[derive(Deserialize)]
+struct CurationPlan {
+    posts: Vec<CuratedPost>,
+}
+
+const CURATION_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"posts":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"format":{"type":"string","enum":["carousel","reel","story_pack"]},"image_ids":{"type":"array","minItems":1,"maxItems":14,"items":{"type":"integer"}},"caption":{"type":"string"},"hashtags":{"type":"array","minItems":4,"maxItems":6,"items":{"type":"string"}},"seconds_per_photo":{"type":"number","minimum":0.8,"maximum":4}},"required":["format","image_ids","caption","hashtags"]}}},"required":["posts"]}"#;
+
+/// Ask the model to curate one wedding's day of content.
+///
+/// The heuristic ranked photographs individually and dealt the top N into
+/// whatever format the quota cycle happened to reach. A carousel is a sequence,
+/// not seven high scorers, and some frames belong alone as a Story. This picks
+/// the sets, matches each to a format, writes the caption in Wayne's voice with
+/// any supplier credit woven in, chooses the hashtags and paces the Reel.
+#[allow(clippy::too_many_arguments)]
+fn ai_curate(
+    c: &Connection,
+    wedding_id: i64,
+    couple: &str,
+    venue: &str,
+    wedding_date: &str,
+    candidates: &[i64],
+    quota: &HashMap<String, u32>,
+) -> Option<Vec<CuratedPost>> {
+    if candidates.len() < 8 {
+        return None;
+    }
+    let executable = command_path("claude")?;
+    let model = c
+        .query_row("SELECT value FROM app_settings WHERE key='claude_model_strategy'", [], |r| r.get::<_, String>(0))
+        .unwrap_or_else(|_| "opus".into());
+    // A compact catalogue: enough for judgement, small enough to reason over.
+    let mut catalogue = String::new();
+    for id in candidates.iter().take(70) {
+        if let Ok(line) = c.query_row(
+            "SELECT COALESCE(a.sub_category,''),COALESCE(a.mood,''),COALESCE(a.social_score,0),substr(COALESCE(a.description,''),1,150) FROM image_analysis a WHERE a.image_id=?",
+            [id],
+            |r| Ok(format!("  {} | {} | {} | score {} | {}\n", id, r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,String>(3)?)),
+        ) {
+            catalogue.push_str(&line);
+        }
+    }
+    let suppliers = c
+        .prepare("SELECT role,name,instagram_handle FROM suppliers WHERE wedding_id=? AND instagram_confirmed=1 AND instagram_handle<>''")
+        .ok()
+        .and_then(|mut st| st.query_map([wedding_id], |r| Ok(format!("{} {} (@{})", r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?))).ok()
+            .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>().join(", ")))
+        .unwrap_or_default();
+    let recent_captions = c
+        .prepare("SELECT substr(caption,1,90) FROM posts WHERE caption<>'' ORDER BY id DESC LIMIT 8")
+        .ok()
+        .and_then(|mut st| st.query_map([], |r| r.get::<_, String>(0)).ok().map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>().join("\n  ")))
+        .unwrap_or_default();
+    let wanted = quota.iter().map(|(f, n)| format!("{n} {f}")).collect::<Vec<_>>().join(", ");
+    let prompt = format!(
+        "You are curating one day of Instagram content for Wayne, a documentary wedding photographer in the North West of England. Audience: UK couples planning weddings in Lancashire, Cheshire, Greater Manchester, Merseyside and the Lake District.\n\nWedding: {couple} at {venue}, {wedding_date}.\nConfirmed suppliers to credit where it fits naturally: {suppliers}\n\nProduce exactly: {wanted}.\n\nRules:\n- carousel: 3 to 10 photographs, chosen as a SEQUENCE that opens on the strongest frame and reads as a small story. Not simply the highest scores.\n- reel: 8 to 14 photographs in an order that builds. Set seconds_per_photo between 1.2 and 2.5 to suit the pace of the moment.\n- story_pack: 1 photograph that stands completely on its own.\n- Never use the same photograph in two posts.\n- Only use image_ids from the catalogue below.\n- Captions: Wayne's voice — dry, observant, specifically human, British. At least three non-empty lines. Never sentimental, never a cliche, never 'capturing memories' or 'magical moment'. Do not invent names, dialogue or facts you cannot see.\n- Weave a supplier credit into a caption only where it genuinely fits; otherwise omit it.\n- 4 to 6 hashtags per post, including at least one North West locality tag a searching couple would use.\n- Do not repeat the openings of these recent captions:\n  {recent_captions}\n\nMeasured performance to weigh:\n{}\nPhotograph catalogue — id | moment | mood | score | description:\n{}",
+        strategy_evidence(c),
+        catalogue
+    );
+    let mut command = Command::new(executable);
+    command.arg("--model").arg(model);
+    command.args(["--print", "--output-format", "json", "--json-schema", CURATION_SCHEMA,
+                  "--permission-mode", "dontAsk", "--no-session-persistence"]);
+    let (success, stdout, stderr) = match run_with_input(&mut command, &prompt, StdDuration::from_secs(420)) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("curation: could not run Claude: {error}");
+            return None;
+        }
+    };
+    if !success {
+        eprintln!("curation: Claude failed. stderr: {} | stdout: {}",
+            String::from_utf8_lossy(&stderr).trim(),
+            String::from_utf8_lossy(&stdout).chars().take(2500).collect::<String>());
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&stdout);
+    let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("curation: unreadable response ({error}): {}", raw.chars().take(300).collect::<String>());
+            return None;
+        }
+    };
+    let payload = value
+        .get("structured_output")
+        .cloned()
+        .or_else(|| value.get("result").and_then(|r| r.as_str()).and_then(|r| serde_json::from_str(r.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim()).ok()))
+        .unwrap_or(value);
+    let plan: CurationPlan = match serde_json::from_value(payload.clone()) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("curation: response did not match the schema ({error}): {}", payload.to_string().chars().take(300).collect::<String>());
+            return None;
+        }
+    };
+    // Validate before trusting it: real ids, no reuse, sane set sizes.
+    let allowed = candidates.iter().copied().collect::<std::collections::HashSet<_>>();
+    let mut seen = std::collections::HashSet::new();
+    for post in &plan.posts {
+        let size_ok = match post.format.as_str() {
+            "carousel" => (3..=10).contains(&post.image_ids.len()),
+            "reel" => (2..=14).contains(&post.image_ids.len()),
+            "story_pack" => post.image_ids.len() == 1,
+            _ => false,
+        };
+        if !size_ok {
+            eprintln!("curation rejected: {} with {} photographs is not a valid set size", post.format, post.image_ids.len());
+            return None;
+        }
+        let lines = post.caption.lines().filter(|l| !l.trim().is_empty()).count();
+        if lines < 3 {
+            eprintln!("curation rejected: caption has {lines} lines, needs three");
+            return None;
+        }
+        if let Some(bad) = post.image_ids.iter().find(|id| !allowed.contains(id)) {
+            eprintln!("curation rejected: image {bad} is not in the candidate list");
+            return None;
+        }
+        if let Some(dupe) = post.image_ids.iter().find(|id| !seen.insert(**id)) {
+            eprintln!("curation rejected: image {dupe} used in more than one post");
+            return None;
+        }
+    }
+    if plan.posts.is_empty() {
+        return None;
+    }
+    Some(plan.posts)
 }
 
 fn brand_caption(couple: &str, venue: &str, category: &str, index: usize) -> String {
@@ -2471,6 +2639,48 @@ fn vision_prompt(items: &[(i64, String)], couple: &str, venue: &str) -> String {
     format!("Visually inspect every supplied wedding preview. Return a JSON object with a results array containing one result per image_id. Identify the real wedding-day section from visible evidence, describe the specific human moment and mood, and write a unique Instagram caption in Wayne's natural British documentary voice. The caption must have at least three non-empty lines, be emotionally observant rather than sentimental, and never invent names, dialogue, relationships or facts not visible. Avoid clichés including 'capturing memories', 'magical moment', 'love was in the air', 'picture perfect', and 'a day to remember'. Add exactly five relevant hashtags beginning with #, including useful venue, location and category terms only where justified. The audience is couples planning weddings in the North West of England — Lancashire, Cheshire, Greater Manchester, Merseyside and the Lake District — so favour hashtags that a British couple searching for a photographer in that region would actually use. Couple: {couple}. Venue: {venue}.\n\n{list}")
 }
 
+/// Run a CLI with the prompt on stdin rather than as an argument.
+///
+/// A 20KB prompt passed through argv came back with is_error and zero tokens —
+/// the CLI never reached the API. stdin is the interface it actually wants, and
+/// it warns as much when nothing arrives.
+fn run_with_input(
+    command: &mut Command,
+    input: &str,
+    timeout: StdDuration,
+) -> Result<(bool, Vec<u8>, Vec<u8>), String> {
+    use std::io::Write;
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    if let Some(mut pipe) = child.stdin.take() {
+        pipe.write_all(input.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                pipe.read_to_end(&mut stdout).map_err(|e| e.to_string())?;
+            }
+            if let Some(mut pipe) = child.stderr.take() {
+                pipe.read_to_end(&mut stderr).map_err(|e| e.to_string())?;
+            }
+            return Ok((status.success(), stdout, stderr));
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Provider timed out".into());
+        }
+        thread::sleep(StdDuration::from_millis(250));
+    }
+}
+
 fn run_with_timeout(
     command: &mut Command,
     timeout: StdDuration,
@@ -2579,7 +2789,25 @@ fn run_codex_vision(
     result
 }
 
+/// Locate a CLI without relying on the login shell.
+///
+/// launchd agents run with a minimal PATH that excludes ~/.local/bin, so the
+/// scheduled strategy, review and curation calls would have found no Claude and
+/// silently fallen back to heuristics — the AI brain would simply never have
+/// run on a schedule.
 fn command_path(name: &str) -> Option<String> {
+    let home = dirs::home_dir().unwrap_or_default();
+    let candidates = [
+        home.join(".local/bin").join(name),
+        home.join("bin").join(name),
+        PathBuf::from("/opt/homebrew/bin").join(name),
+        PathBuf::from("/usr/local/bin").join(name),
+        PathBuf::from("/usr/bin").join(name),
+    ];
+    if let Some(found) = candidates.iter().find(|path| path.exists()) {
+        return Some(found.to_string_lossy().to_string());
+    }
+    // Fall back to the user's shell, which finds anything installed elsewhere.
     let output = Command::new("/bin/zsh")
         .args(["-lc", &format!("command -v {name}")])
         .output()
@@ -3363,7 +3591,7 @@ fn ai_strategy(c: &Connection) -> Option<AiStrategy> {
         .unwrap_or(value);
     let strategy: AiStrategy = serde_json::from_value(payload).ok()?;
     let total: u32 = strategy.daily_quota.values().sum();
-    if total < 5 || total > 12 || strategy.posting_hours.len() < total as usize {
+    if !(5..=12).contains(&total) || strategy.posting_hours.len() < total as usize {
         return None;
     }
     if let Ok(json) = serde_json::to_string(&strategy) {
@@ -3377,8 +3605,15 @@ fn ai_strategy(c: &Connection) -> Option<AiStrategy> {
 /// Open the database the way the scheduled agents do.
 fn headless_db() -> Result<(Connection, PathBuf), String> {
     let data = dirs::data_dir().ok_or("No Application Support directory")?.join("com.socialflow.desktop");
-    let cache = dirs::cache_dir().ok_or("No cache directory")?.join("com.socialflow.desktop").join("thumbnails");
-    let c = Connection::open(data.join("socialflow.db")).map_err(|e| e.to_string())?;
+    // SOCIALFLOW_DB / SOCIALFLOW_CACHE let a dry run work against a copy without
+    // redirecting HOME, which would hide the Keychain and the Claude login.
+    let database = std::env::var("SOCIALFLOW_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| data.join("socialflow.db"));
+    let cache = std::env::var("SOCIALFLOW_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs::cache_dir().unwrap_or_default().join("com.socialflow.desktop").join("thumbnails"));
+    let c = Connection::open(&database).map_err(|e| e.to_string())?;
     migrations(&c).map_err(|e| e.to_string())?;
     Ok((c, cache))
 }
@@ -3436,6 +3671,37 @@ pub fn review_last_week() -> Result<(), String> {
     c.execute("INSERT INTO app_settings(key,value)VALUES('ai_last_review_at',strftime('%Y-%m-%d %H:%M','now','localtime')) ON CONFLICT(key) DO UPDATE SET value=excluded.value", []).map_err(|e| e.to_string())?;
     println!("{lessons}");
     Ok(())
+}
+
+/// Curate one wedding and print the result, without writing anything.
+pub fn try_curate(wedding_id: i64) -> Result<(), String> {
+    let (c, _) = headless_db()?;
+    let (couple, venue, date, collection) = c
+        .query_row("SELECT couple_names,venue,wedding_date,collection_id FROM weddings WHERE id=?", [wedding_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))
+        .map_err(|e| e.to_string())?;
+    let ids = c
+        .prepare("SELECT i.id FROM images i JOIN image_analysis a ON a.image_id=i.id WHERE i.collection_id=? AND a.provider IN ('claude','openai') AND NOT EXISTS(SELECT 1 FROM post_images WHERE image_id=i.id) LIMIT 200")
+        .map_err(|e| e.to_string())?
+        .query_map([collection], |r| r.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    let ids = rank_campaign_images(&c, ids);
+    let quota = HashMap::from([("carousel".to_string(), 3u32), ("reel".to_string(), 1), ("story_pack".to_string(), 2)]);
+    println!("{} candidates for {couple}", ids.len());
+    match ai_curate(&c, wedding_id, &couple, &venue, &date, &ids, &quota) {
+        Some(posts) => {
+            for post in posts {
+                println!("\n=== {} · {} photographs · {:.1}s per frame ===", post.format, post.image_ids.len(), post.seconds_per_photo.unwrap_or(1.8));
+                println!("images: {:?}", post.image_ids);
+                println!("{}", post.caption);
+                println!("{}", post.hashtags.join(" "));
+            }
+            Ok(())
+        }
+        None => Err("curation was rejected — see the reason above".into()),
+    }
 }
 
 /// Print the model's strategy without generating anything.
@@ -3708,6 +3974,7 @@ mod tests {
                 second.to_string_lossy().to_string(),
             ],
             &output,
+            1.8,
         )
         .unwrap();
         assert!(fs::metadata(&output).unwrap().len() > 1_000);
@@ -3986,7 +4253,7 @@ mod story_preview {
             return;
         };
         let paths = images.split(',').map(str::to_string).collect::<Vec<_>>();
-        render_photo_reel(&paths, std::path::Path::new(&out)).unwrap();
+        render_photo_reel(&paths, std::path::Path::new(&out), 1.8).unwrap();
     }
 
     /// Renders one Story to eyeball the overlay:

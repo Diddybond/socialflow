@@ -8,6 +8,10 @@ fn main() {
         Some(socialflow_lib::review_last_week())
     } else if has("--prepare-week") {
         Some(socialflow_lib::prepare_week_headless())
+    } else if has("--curate") {
+        let wedding = args.iter().position(|a| a == "--curate")
+            .and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<i64>().ok()).unwrap_or(1);
+        Some(socialflow_lib::try_curate(wedding))
     } else if has("--strategy") {
         Some(socialflow_lib::show_strategy(has("--refresh")))
     } else {
