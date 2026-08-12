@@ -308,6 +308,27 @@ fn migrations(c: &Connection) -> rusqlite::Result<()> {
         // batch per five photographs — so it stays on the mid-tier model.
         c.execute_batch("UPDATE app_settings SET value='opus' WHERE key IN ('claude_model_strategy','claude_model_diagnosis'); INSERT INTO schema_migrations(version)VALUES(12);")?;
     }
+    let has_v13 = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=13)",
+        [],
+        |r| r.get::<_, bool>(0),
+    )?;
+    if !has_v13 {
+        // A Facebook or TikTok copy is the same post on another platform, not an
+        // extra post. Without this link the scheduler gives every copy its own
+        // slot, so seven couples spread over fourteen days instead of seven.
+        c.execute_batch("ALTER TABLE posts ADD COLUMN mirrors_post_id INTEGER REFERENCES posts(id) ON DELETE SET NULL; CREATE INDEX IF NOT EXISTS idx_posts_mirrors ON posts(mirrors_post_id); INSERT INTO schema_migrations(version)VALUES(13);")?;
+    }
+    let has_v14 = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=14)",
+        [],
+        |r| r.get::<_, bool>(0),
+    )?;
+    if !has_v14 {
+        // Generated posts go straight to the queue and publish at their time.
+        // Set require_approval to 'true' to put the review gate back.
+        c.execute_batch("INSERT OR IGNORE INTO app_settings(key,value)VALUES('require_approval','false'); INSERT INTO schema_migrations(version)VALUES(14);")?;
+    }
     c.execute(
         "INSERT OR IGNORE INTO app_settings(key,value)VALUES('posting_time_mode','suggest')",
         [],
@@ -949,7 +970,7 @@ const NORTH_WEST_TAGS: [&str; 8] = [
     "#manchesterweddingphotographer",
     "#liverpoolweddingphotographer",
     "#ribblevalleywedding",
-    "#yorkshireweddingphotographer",
+    "#cumbriaweddingphotographer",
 ];
 
 /// Ensure at least one North West locality tag is present.
@@ -961,7 +982,7 @@ fn ensure_regional_reach(c: &Connection, mut tags: Vec<String>, index: usize) ->
     let has_region = tags.iter().any(|tag| {
         let lower = tag.to_lowercase();
         NORTH_WEST_TAGS.iter().any(|regional| lower == *regional)
-            || ["lancashire", "cheshire", "lakedistrict", "northwest", "manchester", "liverpool"]
+            || ["lancashire", "cheshire", "lakedistrict", "northwest", "manchester", "liverpool", "cumbria", "ribble", "merseyside"]
                 .iter()
                 .any(|place| lower.contains(place))
     });
@@ -1678,6 +1699,11 @@ fn create_content_campaign(
     let start = Local::now().date_naive();
     let facebook_separate = tx.query_row("SELECT EXISTS(SELECT 1 FROM facebook_accounts WHERE profile_id=? AND connected=1) AND COALESCE((SELECT value FROM app_settings WHERE key='facebook_separate_posts'),'false')='true'", [profile_id], |r| r.get::<_,bool>(0)).unwrap_or(false);
     let tiktok_separate = tx.query_row("SELECT EXISTS(SELECT 1 FROM tiktok_accounts WHERE profile_id=? AND connected=1) AND COALESCE((SELECT value FROM app_settings WHERE key='tiktok_reel_copies'),'false')='true'", [profile_id], |r| r.get::<_,bool>(0)).unwrap_or(false);
+    let require_approval = tx
+        .query_row("SELECT value='true' FROM app_settings WHERE key='require_approval'", [], |r| r.get::<_, bool>(0))
+        .unwrap_or(false);
+    // Without the review gate a post is queued ready to go; with it, it waits.
+    let queued_status = if require_approval { "needs_review" } else { "scheduled" };
     let mut created_post_ids = Vec::new();
     tx.execute("INSERT INTO campaigns(profile_id,collection_id,name,start_date,requested_post_count,posts_per_week,status)VALUES(?,?,?, ?,?,35,'proposed')", params![profile_id,collection_id,format!("{} Content Studio",couple),start.to_string(),count]).map_err(|e|e.to_string())?;
     let campaign_id = tx.last_insert_rowid();
@@ -1736,7 +1762,7 @@ fn create_content_campaign(
             let day = start + Duration::days((index / per_day) as i64);
             slot_at(day, minutes[index % per_day]).to_string()
         });
-        let status = if can_publish { "needs_review" } else { "draft" };
+        let status = if can_publish { queued_status } else { "draft" };
         tx.execute("INSERT INTO posts(profile_id,caption,hashtags_json,status,scheduled_at,post_type,ai_generated)VALUES(?,?,?,?,?,?,1)",params![profile_id,caption,tags,status,scheduled,format]).map_err(|e|e.to_string())?;
         let post_id = tx.last_insert_rowid();
         created_post_ids.push(post_id);
@@ -1786,8 +1812,9 @@ fn create_content_campaign(
     let mut copied_post_ids = Vec::new();
     if facebook_separate {
         for instagram_post_id in &created_post_ids {
-            tx.execute("INSERT INTO posts(profile_id,caption,hashtags_json,status,scheduled_at,published_at,post_type,created_at,updated_at,manually_edited_caption,ai_generated,asset_path,platform) SELECT profile_id,caption,hashtags_json,'needs_review',scheduled_at,NULL,post_type,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,0,ai_generated,asset_path,'facebook' FROM posts WHERE id=?", [instagram_post_id]).map_err(|e|e.to_string())?;
+            tx.execute("INSERT INTO posts(profile_id,caption,hashtags_json,status,scheduled_at,published_at,post_type,created_at,updated_at,manually_edited_caption,ai_generated,asset_path,platform) SELECT profile_id,caption,hashtags_json,?,scheduled_at,NULL,post_type,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,0,ai_generated,asset_path,'facebook' FROM posts WHERE id=?", params![queued_status, instagram_post_id]).map_err(|e|e.to_string())?;
             let facebook_post_id = tx.last_insert_rowid();
+            tx.execute("UPDATE posts SET mirrors_post_id=? WHERE id=?", params![instagram_post_id, facebook_post_id]).map_err(|e| e.to_string())?;
             copied_post_ids.push(facebook_post_id);
             tx.execute("INSERT INTO post_images(post_id,image_id,position) SELECT ?,image_id,position FROM post_images WHERE post_id=?", params![facebook_post_id,instagram_post_id]).map_err(|e|e.to_string())?;
         }
@@ -1798,6 +1825,7 @@ fn create_content_campaign(
             if !is_reel { continue; }
             tx.execute("INSERT INTO posts(profile_id,caption,hashtags_json,status,scheduled_at,published_at,post_type,created_at,updated_at,manually_edited_caption,ai_generated,asset_path,platform) SELECT profile_id,caption,hashtags_json,'needs_review',scheduled_at,NULL,post_type,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,0,ai_generated,asset_path,'tiktok' FROM posts WHERE id=?", [instagram_post_id]).map_err(|e|e.to_string())?;
             let tiktok_post_id = tx.last_insert_rowid();
+            tx.execute("UPDATE posts SET mirrors_post_id=? WHERE id=?", params![instagram_post_id, tiktok_post_id]).map_err(|e| e.to_string())?;
             copied_post_ids.push(tiktok_post_id);
             tx.execute("INSERT INTO post_images(post_id,image_id,position) SELECT ?,image_id,position FROM post_images WHERE post_id=?", params![tiktok_post_id,instagram_post_id]).map_err(|e|e.to_string())?;
         }
@@ -1887,7 +1915,7 @@ fn reflow_wedding_rotation(
     posts_per_day: u32,
 ) -> Result<(), String> {
     let wedding_ids = tx
-        .prepare(&format!("SELECT w.id FROM weddings w WHERE EXISTS(SELECT 1 FROM posts p JOIN post_images pi ON pi.post_id=p.id JOIN images i ON i.id=pi.image_id WHERE i.collection_id=w.collection_id AND p.status IN ('draft','needs_review','approved','scheduled') AND p.id IN (SELECT id FROM posts WHERE {PUBLISHABLE_SQL})) ORDER BY w.created_at,w.id"))
+        .prepare(&format!("SELECT w.id FROM weddings w WHERE EXISTS(SELECT 1 FROM posts p JOIN post_images pi ON pi.post_id=p.id JOIN images i ON i.id=pi.image_id WHERE i.collection_id=w.collection_id AND p.status IN ('draft','needs_review','approved','scheduled') AND p.mirrors_post_id IS NULL AND p.id IN (SELECT id FROM posts WHERE {PUBLISHABLE_SQL})) ORDER BY w.created_at,w.id"))
         .map_err(|e| e.to_string())?
         .query_map([], |r| r.get::<_, i64>(0))
         .map_err(|e| e.to_string())?
@@ -1896,7 +1924,7 @@ fn reflow_wedding_rotation(
     let mut groups = Vec::new();
     for wedding_id in wedding_ids {
         let post_ids = tx
-            .prepare(&format!("SELECT DISTINCT p.id FROM posts p JOIN post_images pi ON pi.post_id=p.id JOIN images i ON i.id=pi.image_id JOIN weddings w ON w.collection_id=i.collection_id WHERE w.id=? AND p.status IN ('draft','needs_review','approved','scheduled') AND p.id IN (SELECT id FROM posts WHERE {PUBLISHABLE_SQL}) ORDER BY p.id"))
+            .prepare(&format!("SELECT DISTINCT p.id FROM posts p JOIN post_images pi ON pi.post_id=p.id JOIN images i ON i.id=pi.image_id JOIN weddings w ON w.collection_id=i.collection_id WHERE w.id=? AND p.status IN ('draft','needs_review','approved','scheduled') AND p.mirrors_post_id IS NULL AND p.id IN (SELECT id FROM posts WHERE {PUBLISHABLE_SQL}) ORDER BY p.id"))
             .map_err(|e| e.to_string())?
             .query_map([wedding_id], |r| r.get::<_, i64>(0))
             .map_err(|e| e.to_string())?
@@ -1920,6 +1948,12 @@ fn reflow_wedding_rotation(
             .map_err(|e| e.to_string())?;
         }
     }
+    // A copy goes out with its original, on the same day at the same time.
+    tx.execute(
+        "UPDATE posts SET scheduled_at=(SELECT scheduled_at FROM posts original WHERE original.id=posts.mirrors_post_id),updated_at=CURRENT_TIMESTAMP WHERE mirrors_post_id IS NOT NULL AND status IN ('draft','needs_review','approved','scheduled')",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 /// Minutes-past-midnight for `count` posts in a day.
