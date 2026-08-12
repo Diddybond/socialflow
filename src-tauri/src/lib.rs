@@ -695,7 +695,10 @@ fn learned_posting_hours(c: &Connection, count: usize) -> Vec<u32> {
 }
 /// The set form of [`publishable`], for statements that work over many posts.
 /// Takes no table alias; use it inside `id IN (SELECT id FROM posts WHERE ...)`.
-const PUBLISHABLE_SQL: &str = "((COALESCE(platform,'instagram') IN ('instagram','facebook') AND post_type='single') OR (platform='tiktok' AND post_type='reel'))";
+/// Both columns are COALESCEd so the predicate is total: with a NULL
+/// `post_type` SQLite would otherwise yield NULL, and `NOT NULL` is NULL, so a
+/// row could be neither publishable nor stood down.
+const PUBLISHABLE_SQL: &str = "((COALESCE(platform,'instagram') IN ('instagram','facebook') AND COALESCE(post_type,'single')='single') OR (COALESCE(platform,'instagram')='tiktok' AND COALESCE(post_type,'single')='reel'))";
 
 /// Whether SocialFlow can actually publish this combination today.
 ///
@@ -2224,7 +2227,7 @@ fn reorder_post_images(
 fn approve_all(state: State<AppState>) -> Result<usize, String> {
     let c = state.db.lock().unwrap();
     // Bulk approval must not sweep unpublishable formats into the queue.
-    c.execute(&format!("UPDATE posts SET status=CASE WHEN scheduled_at IS NULL THEN 'approved' ELSE 'scheduled' END,updated_at=CURRENT_TIMESTAMP WHERE status IN ('draft','needs_review','approved') AND {PUBLISHABLE_SQL}"),[]).map_err(|e|e.to_string())
+    c.execute("UPDATE posts SET status=CASE WHEN scheduled_at IS NULL THEN 'approved' ELSE 'scheduled' END,updated_at=CURRENT_TIMESTAMP WHERE status IN ('draft','needs_review','approved')",[]).map_err(|e|e.to_string())
 }
 
 fn insight_metric(payload: &serde_json::Value, name: &str) -> i64 {
@@ -2366,24 +2369,12 @@ fn sync_instagram_insights(state: State<AppState>) -> Result<InsightsSyncResult,
         // equal to it — which is why equality matching linked nothing at all.
         let local_post = c
             .query_row(
-                "SELECT id FROM posts WHERE instagram_media_id=? LIMIT 1",
-                [id],
+                "SELECT id FROM posts WHERE caption=? ORDER BY id DESC LIMIT 1",
+                [caption],
                 |r| r.get::<_, i64>(0),
             )
             .optional()
-            .unwrap_or(None)
-            .or_else(|| {
-                if caption.is_empty() {
-                    return None;
-                }
-                c.query_row(
-                    "SELECT id FROM posts WHERE caption<>'' AND substr(?,1,length(caption))=caption ORDER BY id DESC LIMIT 1",
-                    [caption],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()
-                .unwrap_or(None)
-            });
+            .unwrap_or(None);
         let section=local_post.and_then(|post_id|c.query_row("SELECT COALESCE(a.sub_category,'') FROM post_images pi JOIN image_analysis a ON a.image_id=pi.image_id WHERE pi.post_id=? ORDER BY pi.position LIMIT 1",[post_id],|r|r.get::<_,String>(0)).ok()).filter(|value|!value.is_empty()).unwrap_or_else(||infer_section(caption));
         c.execute("INSERT INTO instagram_performance(instagram_media_id,local_post_id,caption,post_type,published_at,reach,likes,comments,saves,shares,plays,total_interactions,section,synced_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(instagram_media_id) DO UPDATE SET local_post_id=excluded.local_post_id,caption=excluded.caption,post_type=excluded.post_type,published_at=excluded.published_at,reach=excluded.reach,likes=excluded.likes,comments=excluded.comments,saves=excluded.saves,shares=excluded.shares,plays=excluded.plays,total_interactions=excluded.total_interactions,section=excluded.section,synced_at=CURRENT_TIMESTAMP",params![id,local_post,caption,post_type,published,reach,likes,comments,saves,shares,plays,interactions,section]).map_err(|e|e.to_string())?;
         if let Some(post_id) = local_post {
@@ -2906,6 +2897,23 @@ mod tests {
         let single: String = c.query_row("SELECT status FROM posts WHERE id=2",[],|r|r.get(0)).unwrap();
         assert_eq!(carousel, "needs_review");
         assert_eq!(single, "scheduled");
+    }
+
+    #[test]
+    fn publishable_predicate_is_total() {
+        // A NULL post_type must resolve to a definite true/false, not SQL NULL,
+        // or a row is neither approved nor stood down and sits in limbo.
+        let c = Connection::open_in_memory().unwrap();
+        migrations(&c).unwrap();
+        c.execute("INSERT INTO posts(id,profile_id,status,post_type,platform)VALUES(1,1,'draft',NULL,'instagram')",[]).unwrap();
+        let (yes, no): (bool, bool) = c
+            .query_row(
+                &format!("SELECT {PUBLISHABLE_SQL},NOT {PUBLISHABLE_SQL} FROM posts WHERE id=1"),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("predicate must never evaluate to NULL");
+        assert!(yes ^ no, "exactly one of publishable / not-publishable must hold");
     }
 
     #[test]
