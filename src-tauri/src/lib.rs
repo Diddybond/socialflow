@@ -1665,10 +1665,32 @@ fn create_content_campaign(
     format_offset: Option<usize>,
     state: State<AppState>,
 ) -> Result<i64, String> {
+    let mut c = state.db.lock().unwrap();
+    build_content_campaign(
+        &mut c, &state.cache, profile_id, image_ids, count, posts_per_day, wedding_id,
+        formats, daily_quota, format_offset,
+    )
+}
+
+/// The campaign builder, independent of Tauri so the scheduled agent can run a
+/// week without the desktop app being open. Full automation means generation
+/// cannot depend on someone pressing a button.
+#[allow(clippy::too_many_arguments)]
+fn build_content_campaign(
+    c: &mut Connection,
+    cache: &Path,
+    profile_id: i64,
+    image_ids: Vec<i64>,
+    count: usize,
+    posts_per_day: u32,
+    wedding_id: i64,
+    formats: Vec<String>,
+    daily_quota: Option<HashMap<String, u32>>,
+    format_offset: Option<usize>,
+) -> Result<i64, String> {
     if image_ids.is_empty() || formats.is_empty() {
         return Err("Choose photographs and at least one content format".into());
     }
-    let mut c = state.db.lock().unwrap();
     let tx = c.transaction().map_err(|e| e.to_string())?;
     let (couple, venue, collection_id) = tx
         .query_row(
@@ -1782,15 +1804,13 @@ fn create_content_campaign(
             }
         }
         let asset = if format == "reel" {
-            let path = state
-                .cache
+            let path = cache
                 .join("reels")
                 .join(format!("reel-{post_id}.mp4"));
             render_photo_reel(&paths, &path)?;
             Some(path.to_string_lossy().to_string())
         } else if format == "story_pack" {
-            let path = state
-                .cache
+            let path = cache
                 .join("story-packs")
                 .join(format!("{}-{post_id}", couple.replace([' ', '&'], "-")));
             let wedding_date = tx
@@ -3225,6 +3245,81 @@ fn publish_post_to_facebook(post_id: i64, state: State<AppState>) -> Result<Stri
         }
     }
 }
+/// Build the next seven days with no app and no button.
+///
+/// One wedding a day, five carousels, a Reel and a Story each, starting
+/// tomorrow so nothing is scheduled into the past. Run by a launchd agent.
+pub fn prepare_week_headless() -> Result<(), String> {
+    let data = dirs::data_dir()
+        .ok_or("No Application Support directory")?
+        .join("com.socialflow.desktop");
+    let cache = dirs::cache_dir()
+        .ok_or("No cache directory")?
+        .join("com.socialflow.desktop")
+        .join("thumbnails");
+    let mut c = Connection::open(data.join("socialflow.db")).map_err(|e| e.to_string())?;
+    migrations(&c).map_err(|e| e.to_string())?;
+
+    // Do not stack a second week on top of one still running.
+    let pending: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM posts WHERE status IN ('scheduled','needs_review','approved') AND scheduled_at>=date('now')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if pending > 0 {
+        println!("{pending} posts are already queued; nothing to prepare");
+        return Ok(());
+    }
+    let weddings = c
+        .prepare("SELECT id,collection_id FROM weddings WHERE collection_id IS NOT NULL AND consent_level NOT IN ('none','portfolio_only') AND (embargo_until IS NULL OR embargo_until<=date('now')) ORDER BY wedding_date DESC,created_at DESC LIMIT 7")
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    if weddings.is_empty() {
+        return Err("No marketing-approved weddings are ready".into());
+    }
+    let quota = HashMap::from([
+        ("carousel".to_string(), 5u32),
+        ("reel".to_string(), 1),
+        ("story_pack".to_string(), 1),
+    ]);
+    let formats = vec![
+        "carousel".to_string(),
+        "reel".to_string(),
+        "story_pack".to_string(),
+    ];
+    let mut produced = 0usize;
+    for (wedding_id, collection_id) in weddings {
+        let image_ids = c
+            .prepare("SELECT i.id FROM images i JOIN image_analysis a ON a.image_id=i.id WHERE i.collection_id=? AND a.provider IN ('claude','openai') AND i.missing=0")
+            .map_err(|e| e.to_string())?
+            .query_map([collection_id], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        if image_ids.is_empty() {
+            continue;
+        }
+        match build_content_campaign(
+            &mut c, &cache, 1, image_ids, 7, 7, wedding_id, formats.clone(),
+            Some(quota.clone()), Some(produced),
+        ) {
+            Ok(_) => {
+                produced += 7;
+                println!("prepared wedding {wedding_id}");
+            }
+            // One wedding failing must not abandon the rest of the week.
+            Err(error) => eprintln!("wedding {wedding_id} skipped: {error}"),
+        }
+    }
+    println!("prepared {produced} posts");
+    Ok(())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
