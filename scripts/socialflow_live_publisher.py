@@ -552,7 +552,9 @@ def publish_instagram_reel(account: str, token: str, video_url: str, caption: st
     container = api(
         f"https://graph.instagram.com/{account}/media",
         token,
-        {"media_type": "REELS", "video_url": video_url, "caption": caption},
+        # thumb_offset picks the grid cover; without it Instagram uses frame
+        # zero, which is why faded-in Reels showed as a black tile.
+        {"media_type": "REELS", "video_url": video_url, "caption": caption, "thumb_offset": "800"},
     )["id"]
     # Video transcoding is far slower than a photograph copy.
     await_container(container, token, 600)

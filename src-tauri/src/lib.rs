@@ -1510,11 +1510,15 @@ fn render_photo_reel(paths: &[String], output: &Path, seconds: f64) -> Result<()
         // to 1080x1920 threw away about half of every landscape frame.
         // The blur is done at low resolution and scaled back up, which looks
         // identical to a full-size gaussian and renders far faster.
+        // The very first frame must be the photograph, not black: Instagram
+        // takes the grid thumbnail from frame zero, so a fade-in from black
+        // gave every Reel a black tile in the profile grid.
+        let fade_in = if index == 0 { String::new() } else { "fade=t=in:st=0:d=0.22,".to_string() };
         filters.push(format!(
             "[{index}:v]split=2[bg{index}][fg{index}];\
              [bg{index}]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,scale=108:192,gblur=sigma=6,scale=1080:1920,eq=brightness=-0.06[bb{index}];\
              [fg{index}]scale=1080:1920:force_original_aspect_ratio=decrease[fg2{index}];\
-             [bb{index}][fg2{index}]overlay=(W-w)/2:(H-h)/2,zoompan=z='min(zoom+0.0009,1.08)':d=1:s=1080x1920:fps=30,fade=t=in:st=0:d=0.22,fade=t=out:st={fade_out:.2}:d=0.22,setsar=1[v{index}]"
+             [bb{index}][fg2{index}]overlay=(W-w)/2:(H-h)/2,zoompan=z='min(zoom+0.0009,1.08)':d=1:s=1080x1920:fps=30,{fade_in}fade=t=out:st={fade_out:.2}:d=0.22,setsar=1[v{index}]"
         ));
     }
     let inputs = (0..paths.len())
